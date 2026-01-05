@@ -60,7 +60,7 @@ tidyverse, lubridate, pROC, glmnet, xgboost, purrr
 
 ## Important Note
 The main results document (tables, plots, interpretation) is:
-Scoring_Gonzalez_Mondelli_2.Rmd
+Scoring_Gonzalez_Mondelli.Rmd
 Feel free to review, comment on or improve any part of the code!
 Thank you for your interest in this academic project! ✈️📉
 

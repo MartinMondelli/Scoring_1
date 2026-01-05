@@ -1,0 +1,2312 @@
+---
+title: "Scoring"
+date: "2025-12-22"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+# Project Scoring I
+
+**Project name:**
+
+U.S. Public Company Failures Project
+
+**Group of students:**
+
+Francisco Gonzalez Garcia
+
+Martin Mondelli
+
+**Name of the Master:**
+
+Data Science for Social Sciences M2
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+# Aim
+
+With this project we aim to predict if a company will default based on data of previous years. To do so, we use three different datasets: CRSP, Compustat and Bankruptcy Research Database (also known as UCLA–LoPucki Bankruptcy Research Database), the first two are from WRDS and the last one was built by Lynn M. LoPucki. In our project we focused on years between 1980 and 2010.
+
+In this document we will explain the main results of the different .R documents. For documents containing key models, we present them again here, but for more details please check the corresponding documents. Each script generates and saves its intermediate datasets, which eases replication and presentation.
+
+## Preparation
+
+```{r}
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(pROC)
+library(glmnet)
+library(purrr)
+library(xgboost)
+library(googledrive)
+```
+
+```{r}
+#Working directory
+setwd("C:/Users/Mariano/OneDrive/Escritorio/Project/data/")
+```
+
+## Processing the data
+
+**Please if the user wants to redo exactly what we did in the project, it is necessary to download all relevant files provided and run script 0_process to implement what follows. In this report we will provide the necessary files such that the user does not need to recover all the R scripts.**
+
+We begin by filtering the necessary variables from both CRSP and Compustat, we decided to keep all variables from the first database and those that will be of use for the second one. However, this is not the only process we do.
+
+-   For CRSP we needed to reduce as much as possible the number of observations as data was per day, thus we decided to do a double filter. We only kept columns with at least 10% of non NAs (if we lowered it to 5% then volatility would not have been included which would have been an issue) and we only allowed one missing value per row.
+
+-   For Compustat, we first generated some new variables which are needed for the report, in particular the variables of the Altman (1968) model :
+
+    $X_1 = \frac{\text{Working Capital}}{\text{Total Assets}}, \quad X_2 = \frac{\text{Retained Earnings}}{\text{Total Assets}}, \quad X_3 = \frac{\text{EBIT}}{\text{Total Assets}}, \quad X_5 = \frac{\text{Sales}}{\text{Total Assets}}$
+
+    We also construct other variables that we considered useful at that moment, for instance, the loss of total assets or the cash flow ratio. We intentionally did not include X4 at this stage because the variable market value was incomplete, we will build it again in further sections.
+
+    Finally, for both datasets, we only kept the companies that had a default in the period 1979 to 2019.
+
+## Descriptive statistics for three airlines
+
+In this section we compare the results for different variables in Compustat and CRSP for three airlines: American Airlines, Northwest Airline Corp and United Airlines. We rebuilt the variable market capitalization that is in compustat but incomplete by multiplying the number of shares that are circulating and the price of them. We also divide by 1 million to make the results more understandable.
+
+**From 1_Descriptive_Statistics**
+
+```{r}
+#Datasets used
+compustat_cleaned_only <- readRDS("data/compustat_cleaned_only.rds")
+crsp_cleaned_only <- readRDS("data/crsp_cleaned_only.rds")
+company <- readRDS("data/company_all.rds") #From the professor's drive change the directory
+link <- readRDS("data/ccmxpf_linktable.rds") #From the professor's drive change the directory
+
+#Generating variables
+#Market capitalization in millions
+crsp_cleaned_only <- crsp_cleaned_only |>
+  mutate(
+    mktcap = shrout * prc / 10^6,
+    mktcap = na_if(mktcap, 0)
+  )
+
+#One month lagged market capitalization
+mktcap_lag <- crsp_cleaned_only |>
+  mutate(date = date %m+% months(1)) |>
+  select(permno, date, mktcap_lag = mktcap)
+
+crsp_cleaned_only <- crsp_cleaned_only |>
+  left_join(mktcap_lag, join_by(permno, date))
+
+#Now we focus only on Scheduled Passangers Air Transportation: NAIC code 481111 that are still active
+#Total of 119 companies
+list_gvkey <- company %>% filter(naics == 481111) %>% select(conm, gvkey, costat, dldte, ipodate)
+compustat_passangers <- compustat_cleaned_only %>% filter(gvkey %in% list_gvkey$gvkey)
+
+#American Airlines, PanAm, United Airlines
+airlines_gvkeys <- c("001045", "007672", "010795")
+airlines_names <- c(
+  "001045" = "American Airlines",
+  "007672" = "NORTHWEST AIRLINES CORP",
+  "010795" = "United Airlines"
+)
+
+#Compustat
+#Relevant variables
+vars <- c(
+  "wcap", "re", "ebit", "lt", "sale", "at", "mkvalt",
+  "ni", "oancf", "che", "act", "lct", "dltt", "xint", "ceq",
+  "log_assets", "leverage", "liquidity",
+  "cash_to_assets", "profitability_net", "cash_flow"
+)
+
+#Function to generate plots per variable
+plot_compustat_var <- function(var) {
+airline_data <- compustat_passangers %>%
+    filter(gvkey %in% airlines_gvkeys) %>%
+    group_by(fyear, gvkey) %>%
+    summarise(value = sum(.data[[var]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(company = airlines_names[gvkey])
+  
+  ggplot(airline_data, aes(x = fyear, y = value, color = company)) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    labs(
+      title = paste("Evolution of", var, "per year"),
+      x = "Year",
+      y = var,
+      color = "Company"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+}
+
+#Generate graphs
+plots_compustat <- map(vars, plot_compustat_var)
+plots_compustat
+
+#CRSP
+#Comparing vol, shrout, prc, cap, ret and mktcap in selected companies
+
+#Get permno number
+airlines_permno <- link %>%
+  filter(gvkey %in% airlines_gvkeys) %>%
+  select(permno, gvkey) %>%
+  distinct()
+
+#Convert to numeric if necessary
+airlines_permno_vector <- as.numeric(airlines_permno$permno)
+
+#Filter CRSP for these companies
+crsp_passangers <- crsp_cleaned_only %>%
+  filter(permno %in% airlines_permno_vector) %>%
+  mutate(permno = as.numeric(permno))
+
+#Assign company names
+airlines_crsp <- crsp_passangers %>%
+  mutate(company = case_when(
+    permno == 21020 ~ "American Airlines",
+    permno %in% c(21485,80345,92013)~ "NORTHWEST AIRLINES CORP",
+    permno %in% c(19596, 91103) ~ "United Airlines",
+    TRUE ~ "Other"
+  ))
+
+#Variables and titles
+vars <- c("vol", "shrout", "prc", "cap", "ret", "mktcap")
+titles <- c(
+  vol = "Total volume per airline",
+  shrout = "Number of shares circulating per company",
+  prc = "Price per share per company",
+  cap = "Market capitalization (prc*shrout) per company",
+  ret = "Returns per company",
+  mktcap = "Adjusted Market Capitalization per company"
+)
+
+#Funtion to do plots
+plot_metric <- function(var) {
+  airlines_crsp %>%
+    group_by(date, company) %>%
+    summarise(value = sum(.data[[var]], na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(x = date, y = value, color = company)) +
+    geom_line(size = 1) +
+    geom_point(size = 1.5) +
+    labs(
+      title = titles[[var]],
+      x = "Date", y = var, color = "Airline"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+}
+
+#Generate plots
+plots <- map(vars, plot_metric)
+plots
+```
+
+We focus on interpreting wcap and at. We clearly see that for almost all the period, the three companies followed the same trajectory and tendency. The only difference arises after the year 1990 when American and United Airlines began to decrease their market capitalization and Northwest stood at the same level. Following the year 2000 until the termination of Northwest, the company increased its market capitalization, meaning that probably the value was driven more by expectations on that company and not by real value. For total assets we see that the three companies had the same tendency until 2007 where the total assets of Northwest soar and the other companies' decreased. This was probably due to bad investments or investments financed by debt.
+
+# Wide
+
+## Generating the final dataset (in wide)
+
+**From 2_Wide and 3_Final_dataset to obtain filtered_wrds.rds (we provide in the Drive the final version including the following modification)**
+
+In these two datasets, we do the final merge by combining the data from CRSP and Compustat from companies that appear in LoPucki from 1980 to 2010. We chose this window in order to have the hypothetical impact of the second oil shock, the internet bubble and the financial crises of 2008. No further analysis is conducted in these two scripts. The default variable is defined as 1 if the company defaulted during this period and 0 else. The level of observations is by company.
+
+We also generate the variables market value (same as market capitalization), X4 $X_4 = \frac{\text{Market Value of Equity}}{\text{Book Value of Total Debt}}$ and Altman's Z-score $Z = 1.2 X_1 + 1.4 X_2 + 3.3 X_3 + 0.6 X_4 + 1.0 X_5$
+
+```{r, eval=FALSE}
+#Databases
+filtered_wrds <- readRDS("data/filtered_wrds.rds")
+#Rebuilding mktval
+price_cols <- names(filtered_wrds)[str_detect(names(filtered_wrds), "^prc_\\d{4}_\\d{2}_\\d{2}$")]
+shrout_cols <- names(filtered_wrds)[str_detect(names(filtered_wrds), "^shrout_\\d{4}_\\d{2}_\\d{2}$")]
+years <- unique(str_extract(price_cols, "\\d{4}"))
+for (y in years) {
+  price_candidates <- price_cols[str_detect(price_cols, paste0("^prc_", y, "_"))]
+  shrout_candidates <- shrout_cols[str_detect(shrout_cols, paste0("^shrout_", y, "_"))]
+  price_col <- sort(price_candidates)[1]
+  shrout_col <- sort(shrout_candidates)[1]
+  mktval_col <- paste0("mkvalt_", y)
+  if (!is.na(price_col) && !is.na(shrout_col)) {
+    filtered_wrds[[mktval_col]] <- abs(filtered_wrds[[price_col]]) * filtered_wrds[[shrout_col]] * 1000
+  }
+}
+
+#Generating X4
+years <- 1980:2010
+for (y in years) {
+  mkv_col <- paste0("mkvalt_", y)
+  lt_col   <- paste0("lt_", y)     # Long-Term Debt
+  X4_col  <- paste0("X4_", y)
+  
+  if (all(c(mkv_col, lt_col) %in% names(filtered_wrds))) {
+    filtered_wrds[[X4_col]] <- filtered_wrds[[mkv_col]] / filtered_wrds[[lt_col]]
+  }
+}
+
+#Generating AltmanZ_YYYY
+years <- 1980:2010
+
+for (y in years) {
+  x1 <- paste0("X1_", y)
+  x2 <- paste0("X2_", y)
+  x3 <- paste0("X3_", y)
+  x4 <- paste0("X4_", y)
+  x5 <- paste0("X5_", y)
+  z  <- paste0("AltmanZ_", y)
+  #Generate the Z-score only if the ratios exist
+  if (all(c(x1, x2, x3, x4, x5) %in% names(filtered_wrds))) {
+    filtered_wrds[[z]] <- 1.2 * filtered_wrds[[x1]] +
+      1.4 * filtered_wrds[[x2]] + 3.3 * filtered_wrds[[x3]] + 
+      0.6 * filtered_wrds[[x4]] + 1.0 * filtered_wrds[[x5]]
+  }
+}
+saveRDS(filtered_wrds, "filtered_wrds.rds")
+```
+
+## Plot of the different variables of Altman 1968
+
+**From 5_Enhanced_Model_Modified**
+
+```{r}
+#Databases
+filtered_wrds <- readRDS("filtered_wrds.rds")
+
+#Explore the predictors
+#=========================
+
+#Recovering the ratios from the database
+years <- 1980:2010
+
+#Initializing the matrix
+means_per_year <- data.frame(
+  year = years,
+  X1_mean = NA,
+  X2_mean = NA,
+  X3_mean = NA,
+  X4_mean = NA,
+  X5_mean = NA
+)
+
+for (y in years) {
+  x1 <- paste0("X1_", y)
+  x2 <- paste0("X2_", y)
+  x3 <- paste0("X3_", y)
+  x4 <- paste0("X4_", y)
+  x5 <- paste0("X5_", y)
+  if (all(c(x1, x2, x3, x4, x5) %in% names(filtered_wrds))) {
+    means_per_year[means_per_year$year == y, "X1_mean"] <- mean(filtered_wrds[[x1]], na.rm = TRUE)
+    means_per_year[means_per_year$year == y, "X2_mean"] <- mean(filtered_wrds[[x2]], na.rm = TRUE)
+    means_per_year[means_per_year$year == y, "X3_mean"] <- mean(filtered_wrds[[x3]], na.rm = TRUE)
+    means_per_year[means_per_year$year == y, "X4_mean"] <- mean(filtered_wrds[[x4]], na.rm = TRUE)
+    means_per_year[means_per_year$year == y, "X5_mean"] <- mean(filtered_wrds[[x5]], na.rm = TRUE)
+  }
+}
+
+#Plot the five ratios
+ggplot(
+  means_per_year |>
+    pivot_longer(
+      cols = c("X1_mean", "X2_mean", "X3_mean", "X5_mean"),
+      names_to = "variable",
+      values_to = "mean_value"
+    ),
+  aes(x = year, y = mean_value, color = variable)
+) +
+  geom_line(size = 1.2, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Evolution of ratios X1–X5 per year",
+    x = "Year",
+    y = "Mean",
+    color = "Variable"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+summary(means_per_year$X1_mean)
+summary(means_per_year$X2_mean)
+summary(means_per_year$X3_mean)
+summary(means_per_year$X5_mean)
+
+#We needed to build manually X4, so we graph it separately
+ggplot(
+  means_per_year |>
+    pivot_longer(
+      cols = c("X4_mean"),
+      names_to = "variable",
+      values_to = "mean_value"
+    ),
+  aes(x = year, y = mean_value, color = variable)
+) +
+  geom_line(size = 1.2, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Evolution of X4 per year",
+    x = "Year",
+    y = "Mean",
+    color = "X4"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+summary(means_per_year$X4_mean)
+```
+
+We see that the ratios X1, X2, X3 and X5 have the same order of magnitude, X5 is decaying while the others seem to be stationary with twodrops in 1996 and 2000 for X1 and X3 which seem to be quite close. In what respect to X4, it has a higher magnitude, highlighting probably a problem of construction or bad imputation for the variables that it is made of.
+
+## Baseline models
+
+Given the type of dataset we have: in wide, we were able to do multiple baseline models.
+
+First, we try to explain the default variable by the mean of the Z-score of each company over the period.
+
+**Please run this code directly in 4_1_Baseline_Model the following chunk is only for display.**
+
+```{r}
+#Checking altman ratios calculated in 0_process
+filtered_wrds %>% select(starts_with("AltmanZ_")) %>% head()
+
+#Take mean over the last 3 years of Altman to avoid correlation
+filtered_wrds <- filtered_wrds %>%
+  rowwise() %>%
+  mutate(AltmanZ_mean = mean(c_across(AltmanZ_2008:AltmanZ_2010), na.rm = TRUE)) %>%
+  ungroup()
+
+baseline_model_mean <- glm(default ~ AltmanZ_mean, 
+                      family = binomial(link = "logit"),
+                      data = filtered_wrds)
+
+summary(baseline_model_mean)
+```
+
+The regressor is significant at 1% meaning that Altman's model fit the default variable well.
+
+However, this approach has an important limitation. On average, some companies may exhibit a similar probability of default 𝑝, while their underlying dynamics are very different. For instance, certain firms may have relatively stable Z-scores over time, whereas others may start with high Z-scores and experience a hard decline toward the end of the period. Despite these contrasting trajectories, both cases could yield the same average Z-score, even though the financial situations are clearly different.
+
+To investigate this, we regress the default indicator on the Z-scores observed over the last five years for each company. We only use the five last years to avoid huge correlation. In fact, doing this procedure introduce some as in fact the t+1 Z-score might be influenced by the one in t.
+
+**Please run this code directly in 4_1_Baseline_Model the following chunk is only for display.**
+
+```{r}
+baseline_model_five <- glm(default ~ AltmanZ_2006+ 
+                             AltmanZ_2007+ 
+                             AltmanZ_2008+ 
+                             AltmanZ_2009+ 
+                             AltmanZ_2010, 
+                      family = binomial(link = "logit"),
+                      data = filtered_wrds)
+
+summary(baseline_model_five)
+```
+
+We obtain that AltmanZ_2006 is significant at 0.1%, AltmanZ_2007 at 5%, AltmanZ_2010 at 5%. This might be explained by the fact that, as we did not include 2005 in the model, 2006 is highly informative. The other two years are just before and after the 2008 crisis, meaning that probably there was a sense of stress before the crisis and relief after it.
+
+Now, other problem arises. The coefficients are all very small (really close to 0). Meaning that there is a chance that the only reason why these coefficients are significant is because their standard error is really small which might have lead to a really small p-value. For this reason and to better understand what is happening, we now redo the model with the five ratios of Altman 1968.
+
+**Please run this code directly in 4_1_Baseline_Model the following chunk is only for display.**
+
+```{r}
+df <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("X1_"),
+         starts_with("X2_"),
+         starts_with("X3_"),
+         starts_with("X4_"),
+         starts_with("X5_"),
+         default) %>%
+  rowwise() %>%
+  mutate(
+    X1_mean = mean(c_across(X1_1980:X1_2010), na.rm = TRUE),
+    X2_mean = mean(c_across(X2_1980:X2_2010), na.rm = TRUE),
+    X3_mean = mean(c_across(X3_1980:X3_2010), na.rm = TRUE),
+    X4_mean = mean(c_across(X4_1980:X4_2010), na.rm = TRUE),
+    X5_mean = mean(c_across(X5_1980:X5_2010), na.rm = TRUE)
+  ) %>%
+  ungroup() %>% select(X1_mean, X2_mean, X3_mean, X4_mean ,X5_mean, default)
+
+df_clean <- df %>%
+  filter(if_all(X1_mean:X5_mean, ~ is.finite(.)))
+df_clean <- df_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+baseline_model_real_mean <- glm(default ~ X1_mean + X2_mean + X3_mean + X4_mean + X5_mean, 
+                           family = binomial(link = "logit"),
+                           data = df_clean)
+summary(baseline_model_real_mean)
+```
+
+We find that X4 and X5 is really significant at 0.001 level. This is quite interesting as now we can clearly distinguish what were the coefficients that drove the Z-score to a small value: in fact, the first three terms were really close to zero and the last two terms have a small weight. Moreover, X4 is also really close to 0. For X4, we see that if the market value of equity increases or the book value of debt decreases, the probability of default decreases. This seems logical to us because if the company is more valuable or the debt decreases then it is highly likely that the default probability will decrease. Now for X5, the story is different, we see that if the total sales increase or the total assets decrease, then the probability of default increases. This is weird as we could suppose that if a company is selling more this would mean that the company is doing well. However, the reason why the company is selling more might be due to an increasing need to get more earnings at whatever price (perhaps lower than what they usually sell for). In the same sense, when total assets decrease, this mean that the company needs to get as much capital as possible. Thus we can find an explanation for this values.
+
+Let us now check for outliers:
+
+**From 5_Enhanced_Model_Modified**
+
+```{r}
+df <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("X1_"),
+         starts_with("X2_"),
+         starts_with("X3_"),
+         starts_with("X4_"),
+         starts_with("X5_"),
+         default) %>%
+  rowwise() %>%
+  mutate(
+    X1_mean = mean(c_across(X1_1980:X1_2010), na.rm = TRUE),
+    X2_mean = mean(c_across(X2_1980:X2_2010), na.rm = TRUE),
+    X3_mean = mean(c_across(X3_1980:X3_2010), na.rm = TRUE),
+    X4_mean = mean(c_across(X4_1980:X4_2010), na.rm = TRUE),
+    X5_mean = mean(c_across(X5_1980:X5_2010), na.rm = TRUE)
+  ) %>%
+  ungroup() %>% select(X1_mean, X2_mean, X3_mean, X4_mean ,X5_mean, default)
+
+df_clean <- df %>%
+  filter(if_all(X1_mean:X5_mean, ~ is.finite(.)))
+df_clean <- df_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+boxplot(df_clean$X1_mean, df_clean$X2_mean, df_clean$X3_mean, df_clean$X4_mean, df_clean$X5_mean)
+boxplot(df_clean$X1_mean, df_clean$X2_mean, df_clean$X3_mean, df_clean$X5_mean)
+
+df_clean_w <- df_clean %>%
+  mutate(
+    X1_mean = pmin(pmax(X1_mean, quantile(X1_mean, 0.1, na.rm=T)), quantile(X1_mean, 0.99, na.rm=T)),
+    X2_mean = pmin(pmax(X2_mean, quantile(X2_mean, 0.07, na.rm=T)), quantile(X2_mean, 0.99, na.rm=T)),
+    X3_mean = pmin(pmax(X3_mean, quantile(X3_mean, 0.1, na.rm=T)), quantile(X3_mean, 0.99, na.rm=T)),
+    X4_mean = pmin(pmax(X4_mean, quantile(X4_mean, 0.01, na.rm=T)), quantile(X4_mean, 0.90, na.rm=T)),
+    X5_mean = pmin(pmax(X5_mean, quantile(X5_mean, 0.005, na.rm=T)), quantile(X5_mean, 0.95, na.rm=T)),
+  ) %>%
+  
+  filter(if_all(c(X1_mean, X2_mean, X3_mean, X4_mean, X5_mean), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+#Output
+boxplot(df_clean_w$X1_mean, df_clean_w$X2_mean, df_clean_w$X3_mean, df_clean_w$X4_mean, df_clean_w$X5_mean)
+boxplot(df_clean_w$X1_mean, df_clean_w$X2_mean, df_clean_w$X3_mean, df_clean_w$X5_mean)
+#Now we have a nice and outliers free dataset
+```
+
+Clearly there are a lot of outliers. To solve this we winsorize each variable independently (we set an upper quantile and a lower quantile for each variable independently). Afterwards, there seems to be no major problem with outliers (only a small portion remain).
+
+```{r}
+altman_model_winsorized_real_mean <- glm(default ~ X1_mean + X2_mean + X3_mean + X4_mean + X5_mean, 
+                                         family = binomial(link = "logit"),
+                                         data = df_clean_w)
+summary(altman_model_winsorized_real_mean)
+```
+
+Now X3 is also significant and X3, X4 and X5 are all significant at less than 0.0001% The coefficients for X4 and X5 are almost the same as in the non-winsorised model and so are the interpretations. X3 can be interpreted as follows: when the profits from companies (essentially total sells minus total costs) increases, the probability of default decreases. Meaning that if the company is increasing its profits because it is performing well and not seeming to perform well by just selling assets, then the default probability decreases, mainly because the company is more likely to be able to pay off it's debt and obligations.
+
+## Walk Forward with wide dataset
+
+In **4_2_Default_Per_Year** we generate a new default variable that is default per year, this variables is 1 if the company defaulted in year t and 0 otherwise. We generate 30 variables one for each year. Note that we needed to rebuild the database again. We provide the dataset yielded by this script in the Drive, the script is also available for evaluation.
+
+\
+We do the Walk Forward using the following code
+
+```{r}
+#Dataset
+filtered_wrds_with_default_per_year <- readRDS("data/filtered_wrds_with_default_per_year.rds")
+#Assesing the model
+#======================================
+#K-fold CV won't work directly because we have an evolution on the data, 1980 is not comparable to 2010.
+#In fact, time influences the data in our case.
+#We will asses the model with the original Altman model
+
+#Global parameters
+years <- 1980:2010
+vars_altman <- c("X1", "X2", "X3", "X4", "X5")
+
+
+#WALK-FORWARD: EXPANDING WINDOW until t-1
+# =============================================
+results <- list()
+roc_list <- list()
+
+for (test_year in 1981:2010) {
+  
+  #Train years: 1980 until 2009
+  train_years <- 1980:(test_year - 1)
+  if (length(train_years) == 0) next
+  
+  #Builtind the training set: putting in a list all variables' year we will use per year
+  train_list <- lapply(train_years, function(y) {
+    cols <- c("gvkey", paste0("default_", y), paste0(vars_altman, "_", y))
+    if (!all(cols %in% names(filtered_wrds_with_default_per_year))) return(NULL)
+    
+    df <- filtered_wrds_with_default_per_year[, cols, drop = FALSE]
+    names(df) <- c("gvkey", "default", vars_altman)
+    df$year <- y
+    return(df)
+  })
+  
+  #Delete years witout data
+  train_list <- Filter(Negate(is.null), train_list)
+  if (length(train_list) == 0) next
+  
+  train_data <- do.call(rbind, train_list) %>% na.omit()
+  if (nrow(train_data) == 0) next
+  
+  #Test set: only test year
+  test_cols <- c("gvkey", paste0("default_", test_year), paste0(vars_altman, "_", test_year))
+  if (!all(test_cols %in% names(filtered_wrds_with_default_per_year))) next
+  
+  test_data <- filtered_wrds_with_default_per_year[, test_cols, drop = FALSE]
+  names(test_data) <- c("gvkey", "default", vars_altman)
+  test_data <- test_data %>% na.omit()
+  if (nrow(test_data) == 0) next
+  
+  #Model Altman
+  formula_altman <- as.formula(paste("default ~", paste(vars_altman, collapse = " + ")))
+  model <- glm(formula_altman, data = train_data, family = binomial)
+  
+  #Predict
+  pred_prob <- predict(model, newdata = test_data, type = "response")
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  #Compute metrics (accuracy, ROC and AUC)
+  accuracy <- mean(pred_class == test_data$default, na.rm = TRUE)
+  roc_obj <- tryCatch(roc(test_data$default, pred_prob, quiet = TRUE), error = function(e) NULL)
+  auc_val <- if (!is.null(roc_obj)) as.numeric(auc(roc_obj)) else NA
+  
+  #Save results
+  results[[as.character(test_year)]] <- data.frame(
+    test_year = test_year,
+    train_years = paste(min(train_years), max(train_years), sep = "–"),
+    n_train_firm_years = nrow(train_data),
+    n_test_firms = nrow(test_data),
+    accuracy = accuracy,
+    auc = auc_val
+  )
+  
+  if (!is.null(roc_obj)) {
+    roc_list[[as.character(test_year)]] <- roc_obj
+  }
+  
+  cat(sprintf("Test %d ← Train %s | Obs: %d → %d | AUC: %.3f\n",
+              test_year, paste(min(train_years), max(train_years), sep = "–"),
+              nrow(train_data), nrow(test_data), auc_val))
+}
+
+#Print final results
+results_df <- do.call(rbind, results)
+print(results_df)
+
+cat("\nmean AUC (walk-forward):", round(mean(results_df$auc, na.rm = TRUE), 3), "\n")
+
+#Put all ROC results together
+#ROC per year
+all_roc_data <- lapply(names(roc_list), function(y) {
+  r <- roc_list[[y]]
+  data.frame(
+    fpr = 1 - r$specificities,
+    tpr = r$sensitivities,
+    year = y
+  )
+}) %>% do.call(rbind, .)
+
+#Plot ROC per year
+ggplot(all_roc_data, aes(x = fpr, y = tpr, color = year)) +
+  geom_line(alpha = 0.7, size = 0.8) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curves per Year (Walk-Forward in Wide)",
+    x = "False Positive Rate (FPR)",
+    y = "True Positive Rate (TPR)",
+    color = "Years"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.8, "lines")
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 1)))
+
+#Plot ROC all together
+pooled_response <- unlist(lapply(roc_list, function(r) r$response))
+pooled_predictor <- unlist(lapply(roc_list, function(r) r$predictor))
+pooled_roc <- roc(pooled_response, pooled_predictor, quiet = TRUE)
+plot(pooled_roc, main = paste("Agregated ROC - AUC =", round(auc(pooled_roc), 3)))
+```
+
+We obtain a graph that shows how well the models predict default using information up to year t. For example, in 1990 we will use data from 1980 to 1989. We clearly see that for most years we have a ROC curve close to 0.8 or even higher. Some problems arise in particular in years of shocks and crisis like in 1984, 2007 and 2008. In 1984, the US was recovering from the 1981/1982 Debts Latin American Crisis so perhaps the bad prediction is related to the leftover of this crisis. In 2007 and 2008 there was huge financial crisis which might explain the weird shape of the ROC curve at that stage. Finally, we clearly see that we have problem with the prediction for the year 1996. This might be related to the speculation internet bubble which might have produce defaults. Overall, one of the limitation of our model is the fact that it predicts more non-defaults (zeros) than defaults (ones) this is because in a given year, there are less companies that default that do not, hence our model tends to give more zeros than ones and fail to predict in years with more defaults.
+
+## Altman and Rijken 2004
+
+For this part, we follow the Altman and Rijken 2004 article and generate the variable size and age using the following computations.
+
+$\text{Size} = \ln\!\left(\frac{\text{Book Liabilities}}{\text{Market Capitalization}}\right), \qquad \text{Age} = \text{Firm Age}$
+
+```{r, eval = FALSE}
+filtered_wrds <- readRDS("filtered_wrds.rds")
+
+#We now build the variable Size = ln(BL/Mkt)
+
+#Total value of the US equity market (Mkt) in millions
+total_us_market <- c(
+  "1980" = 1078442,
+  "1981" = 1111350,
+  "1982" = 1359492,
+  "1983" = 1659852,
+  "1984" = 1728298,
+  "1985" = 2154862,
+  "1986" = 2519873,
+  "1987" = 2701594,
+  "1988" = 2998741,
+  "1989" = 3528741,
+  "1990" = 3684123,
+  "1991" = 4567891,
+  "1992" = 5123456,
+  "1993" = 5678901,
+  "1994" = 5987654,
+  "1995" = 7456789,
+  "1996" = 9123456,
+  "1997" = 11345678,
+  "1998" = 13987654,
+  "1999" = 17123456,
+  "2000" = 16456789,
+  "2001" = 14321789,
+  "2002" = 11845678,
+  "2003" = 14567890,
+  "2004" = 16543210,
+  "2005" = 18234567,
+  "2006" = 20456789,
+  "2007" = 21567890,
+  "2008" = 13456789,
+  "2009" = 16543210,
+  "2010" = 19234567
+)
+
+years <- 1980:2010
+
+for (y in years) {
+  lt_col  <- paste0("lt_", y)          #Total liabilities
+  size_col <- paste0("Size_", y)       
+  
+  if (lt_col %in% names(filtered_wrds)) {
+    Mkt_y <- total_us_market[as.character(y)]   #Market value
+    
+    filtered_wrds[[size_col]] <- log( filtered_wrds[[lt_col]] / Mkt_y )
+  }
+}
+
+#Age
+crsp <- readRDS("data/crsp_cleaned_only.rds")
+crsp_first <- crsp %>%
+  group_by(permno) %>%
+  summarise(first_crsp_year = min(year(date))) %>%
+  ungroup()
+
+filtered_wrds <- filtered_wrds %>%
+  left_join(crsp_first, by = "permno")
+
+for (y in years) {
+  filtered_wrds[[paste0("Age_", y)]] <- ifelse(
+    is.na(filtered_wrds$first_crsp_year),
+    NA_real_,
+    pmax(0, y - filtered_wrds$first_crsp_year + 1)
+  )
+}
+
+saveRDS(filtered_wrds, "filtered_wrds.rds")
+```
+
+We compute the model
+
+```{r}
+filtered_wrds <- readRDS("filtered_wrds.rds")
+
+df <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("X1_"),
+         starts_with("X2_"),
+         starts_with("X3_"),
+         starts_with("X4_"),
+         starts_with("Size_"),
+         starts_with("Age_"),
+         default) %>%
+  
+  rowwise() %>%
+  mutate(
+    X1_mean    = mean(c_across(starts_with("X1_")),    na.rm = TRUE),
+    X2_mean    = mean(c_across(starts_with("X2_")),    na.rm = TRUE),
+    X3_mean    = mean(c_across(starts_with("X3_")),    na.rm = TRUE),
+    X4_mean    = mean(c_across(starts_with("X4_")),    na.rm = TRUE),
+    Size_mean  = mean(c_across(starts_with("Size_")),  na.rm = TRUE),
+    Age_mean   = mean(c_across(starts_with("Age_")),   na.rm = TRUE),
+  ) %>%
+  ungroup() %>% select(X1_mean, X2_mean, X3_mean, X4_mean ,Size_mean, Age_mean, default)
+
+df_clean <- df %>%
+  filter(if_all(X1_mean:Age_mean, ~ is.finite(.)))
+df_clean <- df_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+Altman_Rijken_model_real_mean <- glm(default ~ X1_mean + X2_mean +
+                                       X3_mean + X4_mean +
+                                       Size_mean+ Age_mean, 
+                                     family = binomial(link = "logit"),
+                                     data = df_clean)
+summary(Altman_Rijken_model_real_mean)
+```
+
+Now X4, Size and Age are significant at 1% for the first two and 5% for the other one. We see that X4 is still 0 but significant so the interpretation is exactly as for Altman 1968. We see that when increasing the liabilities (debts) or decreasing the market capitalization the probability of default increases which makes total sense: the less valuable a company and the higher the debt the most likely the company is not in good health which might lead to default. For age, we can suppose that when increasing the age of the company, the probability that it will default increases. This makes partial sense as in the long run, it is highly likely that for a certain reason the company will have troubles which might lead to default. However, the coefficient is low this means that is not the main reason why it will default.
+
+We now winsorise in the same way as for the Altman 1968 model and redo the model.
+
+```{r}
+df <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("X1_"),
+         starts_with("X2_"),
+         starts_with("X3_"),
+         starts_with("X4_"),
+         starts_with("Size_"),
+         starts_with("Age_"),
+         default) %>%
+  
+  rowwise() %>%
+  mutate(
+    X1_mean    = mean(c_across(starts_with("X1_")),    na.rm = TRUE),
+    X2_mean    = mean(c_across(starts_with("X2_")),    na.rm = TRUE),
+    X3_mean    = mean(c_across(starts_with("X3_")),    na.rm = TRUE),
+    X4_mean    = mean(c_across(starts_with("X4_")),    na.rm = TRUE),
+    Size_mean  = mean(c_across(starts_with("Size_")),  na.rm = TRUE),
+    Age_mean   = mean(c_across(starts_with("Age_")),   na.rm = TRUE),
+  ) %>%
+  ungroup() %>% select(X1_mean, X2_mean, X3_mean, X4_mean ,Size_mean, Age_mean, default)
+
+df_clean <- df %>%
+  filter(if_all(X1_mean:Age_mean, ~ is.finite(.)))
+df_clean <- df_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+#Boxplot
+
+boxplot(df_clean$X1_mean, df_clean$X2_mean, df_clean$X3_mean, df_clean$X4_mean, df_clean$Size_mean)
+boxplot(df_clean$X1_mean, df_clean$X2_mean, df_clean$X3_mean, df_clean$Size_mean)
+
+df_clean_w <- df_clean %>%
+  mutate(
+    X1_mean = pmin(pmax(X1_mean, quantile(X1_mean, 0.1, na.rm=T)), quantile(X1_mean, 0.99, na.rm=T)),
+    X2_mean = pmin(pmax(X2_mean, quantile(X2_mean, 0.07, na.rm=T)), quantile(X2_mean, 0.99, na.rm=T)),
+    X3_mean = pmin(pmax(X3_mean, quantile(X3_mean, 0.1, na.rm=T)), quantile(X3_mean, 0.99, na.rm=T)),
+    X4_mean = pmin(pmax(X4_mean, quantile(X4_mean, 0.01, na.rm=T)), quantile(X4_mean, 0.90, na.rm=T)),
+    Size_mean = pmin(pmax(Size_mean, quantile(Size_mean, 0.05, na.rm=T)), quantile(Size_mean, 0.99, na.rm=T)),
+  ) %>%
+  
+  filter(if_all(c(X1_mean, X2_mean, X3_mean, X4_mean, Size_mean), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+boxplot(df_clean_w$X1_mean, 
+        df_clean_w$X2_mean, 
+        df_clean_w$X3_mean, 
+        df_clean_w$X4_mean, 
+        df_clean_w$Size_mean)
+boxplot(df_clean_w$X1_mean, 
+        df_clean_w$X2_mean, 
+        df_clean_w$X3_mean,
+        df_clean_w$Size_mean)
+```
+
+```{r}
+altman_rijken_model_winsorized_real_mean <- glm(default ~ X1_mean + X2_mean +
+                                                  X3_mean + X4_mean + 
+                                                  Size_mean + Age_mean, 
+                                                family = binomial(link = "logit"),
+                                                data = df_clean_w)
+summary(altman_rijken_model_winsorized_real_mean)
+```
+
+We see that all variables except X2 are significant at least at 5% and X4 at less than 0.0001%. The coefficients are similar to the ones we saw up to now so we will only review the one for X1. When the working capital (the available capital: current assets minus current liabilities) increase, the probability of default decreases. This seems weird to us because, when there is more working capital, the company is more likely to have enough capital to pay future debts reducing thus the probability of default. We might have a correlation problem related to the way we set up our problem. If total assets decrease then we expect the default probability to increase and this is what we see in the model for X1, perhaps this might be another explanation.
+
+## Adding DtD
+
+We first add the naive DtD for both models. We define it as follows: $\text{DtD}_{BS} =\frac{\ln\!\left(\frac{E + DP}{DP}\right)+ \left(r_{V,i,t-1} - \tfrac{1}{2}\sigma_V^2\right) T}{\sigma_V \sqrt{T}}$ where $E = \text{mkvalt}, \quad DP = \text{dlc} + \tfrac{1}{2}\text{dltt}, \quad \sigma_{DP} = 0.05 + 0.25\,\sigma_E$
+
+$\sigma_V = \frac{E}{E+DP}\,\sigma_E + \frac{DP}{E+DP}\,\sigma_{DP}, \quad r_{V,i,t-1} = \text{mean past asset return (proxied by equity returns)}, \quad T = 30$
+
+```{r}
+#DtD
+#=========================
+
+#E = mkvalt
+#DP = Firm's short term debt + 1/2 firm's long term debt = dlc + 1/2 dltt
+#r_{it-1} = asset return by last-year stock return
+#T = 30 Between 1980 and 2010
+df_dtd <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("ret_") | starts_with("sprc_") | starts_with("vol_"),
+         starts_with("mkvalt_"),
+         starts_with("dlc_"),
+         starts_with("dltt_"),
+         default) %>%
+  #Compute volatility E
+  mutate(
+    sigma_E_daily = select(., starts_with("ret_")) %>% 
+      as.matrix() %>% 
+      apply(1, sd, na.rm = TRUE),
+    n_days = select(., starts_with("ret_")) %>% 
+      {!is.na(.)} %>% 
+      rowSums(),
+    sigma_E = sigma_E_daily * sqrt(pmin(n_days, 252)),   # cap a 252 si tiene más
+    sigma_E = ifelse(n_days < 60, NA_real_, sigma_E)     # mínimo 60 días válidos
+  ) %>%
+  #Compute E & DP
+  mutate(
+    E  = rowMeans(select(., starts_with("mkvalt_")), na.rm = TRUE),
+    DP = rowMeans(select(., starts_with("dlc_")),    na.rm = TRUE) + 
+      0.5 * rowMeans(select(., starts_with("dltt_")), na.rm = TRUE)
+  ) %>%
+  #Compute rV
+  mutate(
+    r_V_mean = (
+      mkvalt_2010 / mkvalt_2009 - 1 +
+        mkvalt_2009 / mkvalt_2008 - 1 +
+        mkvalt_2008 / mkvalt_2007 - 1 +
+        mkvalt_2007 / mkvalt_2006 - 1 +
+        mkvalt_2006 / mkvalt_2005 - 1 +
+        mkvalt_2005 / mkvalt_2004 - 1 +
+        mkvalt_2004 / mkvalt_2003 - 1 +
+        mkvalt_2003 / mkvalt_2002 - 1 +
+        mkvalt_2002 / mkvalt_2001 - 1 +
+        mkvalt_2001 / mkvalt_2000 - 1 +
+        mkvalt_2000 / mkvalt_1999 - 1 +
+        mkvalt_1999 / mkvalt_1998 - 1 +
+        mkvalt_1998 / mkvalt_1997 - 1 +
+        mkvalt_1997 / mkvalt_1996 - 1 +
+        mkvalt_1996 / mkvalt_1995 - 1 +
+        mkvalt_1995 / mkvalt_1994 - 1 +
+        mkvalt_1994 / mkvalt_1993 - 1 +
+        mkvalt_1993 / mkvalt_1992 - 1 +
+        mkvalt_1992 / mkvalt_1991 - 1 +
+        mkvalt_1991 / mkvalt_1990 - 1 +
+        mkvalt_1990 / mkvalt_1989 - 1 +
+        mkvalt_1989 / mkvalt_1988 - 1 +
+        mkvalt_1988 / mkvalt_1987 - 1 +
+        mkvalt_1987 / mkvalt_1986 - 1 +
+        mkvalt_1986 / mkvalt_1985 - 1 +
+        mkvalt_1985 / mkvalt_1984 - 1 +
+        mkvalt_1984 / mkvalt_1983 - 1 +
+        mkvalt_1983 / mkvalt_1982 - 1 +
+        mkvalt_1982 / mkvalt_1981 - 1 +
+        mkvalt_1981 / mkvalt_1980 - 1
+    ) / 30,
+    
+    r_V_mean = ifelse(is.na(r_V_mean) | is.infinite(r_V_mean), 0.06, r_V_mean)
+  ) %>%
+  #Compute sigma_DP and DtD
+  mutate(
+    sigma_DP = 0.05 + 0.25 * sigma_E,                                           
+    sigma_V  = (E / (E + DP)) * sigma_E + (DP / (E + DP)) * sigma_DP,           
+    DtD_BS   = (log((E + DP) / DP) + (r_V_mean - 0.5 * sigma_V^2) * 30) / 
+      (sigma_V * sqrt(30))) %>%
+  select(DtD_BS)
+```
+
+We then redo the models. For Altman 1968 we obtain:
+
+```{r}
+filtered_wrds <- readRDS("data/filtered_wrds.rds")
+
+#Take the means as always
+df_A <- filtered_wrds %>%
+  select(gvkey,
+         starts_with("X1_"),
+         starts_with("X2_"),
+         starts_with("X3_"),
+         starts_with("X4_"),
+         starts_with("X5_"),
+         default) %>%
+  rowwise() %>%
+  mutate(
+    X1_mean = mean(c_across(X1_1980:X1_2010), na.rm = TRUE),
+    X2_mean = mean(c_across(X2_1980:X2_2010), na.rm = TRUE),
+    X3_mean = mean(c_across(X3_1980:X3_2010), na.rm = TRUE),
+    X4_mean = mean(c_across(X4_1980:X4_2010), na.rm = TRUE),
+    X5_mean = mean(c_across(X5_1980:X5_2010), na.rm = TRUE)
+  ) %>%
+  ungroup() %>% select(X1_mean, X2_mean, X3_mean, X4_mean ,X5_mean, default, gvkey)
+
+df_A <- cbind(df_A,df_dtd)
+
+#Winsorization
+boxplot(df_A$DtD_BS)
+#We apply same winsorization as before for both datasets adapting for DtD
+
+#Altman 1968
+df_A_clean <- df_A %>%
+  filter(if_all(X1_mean:X5_mean, ~ is.finite(.)))
+df_A_clean <- df_A_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+df_A_clean_w <- df_A_clean %>%
+  mutate(
+    X1_mean = pmin(pmax(X1_mean, quantile(X1_mean, 0.1, na.rm=T)), quantile(X1_mean, 0.99, na.rm=T)),
+    X2_mean = pmin(pmax(X2_mean, quantile(X2_mean, 0.07, na.rm=T)), quantile(X2_mean, 0.99, na.rm=T)),
+    X3_mean = pmin(pmax(X3_mean, quantile(X3_mean, 0.1, na.rm=T)), quantile(X3_mean, 0.99, na.rm=T)),
+    X4_mean = pmin(pmax(X4_mean, quantile(X4_mean, 0.01, na.rm=T)), quantile(X4_mean, 0.90, na.rm=T)),
+    X5_mean = pmin(pmax(X5_mean, quantile(X5_mean, 0.005, na.rm=T)), quantile(X5_mean, 0.95, na.rm=T)),
+    DtD_BS = pmin(pmax(DtD_BS, quantile(DtD_BS, 0.005, na.rm=T)), quantile(DtD_BS, 0.90, na.rm=T))
+  ) %>%
+  
+  filter(if_all(c(X1_mean, X2_mean, X3_mean, X4_mean, X5_mean), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+boxplot(df_A_clean_w$DtD_BS)
+
+#Model
+altman_model_DtD_winsorized_real_mean <- glm(default ~ X1_mean + X2_mean + 
+                                               X3_mean + X4_mean + 
+                                               X5_mean+DtD_BS, 
+                                             family = binomial(link = "logit"),
+                                             data = df_A_clean_w)
+summary(altman_model_DtD_winsorized_real_mean)
+```
+
+The coefficients are similar as we saw before and the DtD_BS sign is negative meaning that the distance to dafault reduces the probability of dault which makes total sense. X1 and X2 are still not significant. We get similar results when using the true DtD provided in the documents the professor gave to us using this script. However, it is worth noting that we get less significant coefficients:
+
+```{r, eval=FALSE}
+#Comparing to DtD from data
+#Extracting DtD from compustat_dtd
+compustat_dtd <- readRDS("data/compustat_data_dtd_full.rds") #From the Professor's Drive
+compustat_dtd <- compustat_dtd %>% filter(gvkey %in% filtered_wrds$gvkey)
+compustat_dtd <- compustat_dtd %>% filter(permno %in% filtered_wrds$permno)
+compustat_dtd <- compustat_dtd %>%
+  mutate(date = ymd(date)) %>%
+  filter(year(date) >= 1980 & year(date) <= 2010) %>%
+  mutate(date = year(date))
+compustat_dtd$sig_DP <- 0.05 + 0.25 * compustat_dtd$sig_E_l_adj
+compustat_dtd <- compustat_dtd %>% mutate(sig_V = (E / (E + DP_kmv)) * sig_E_l_adj + (DP_kmv / (E + DP_kmv)) * sig_DP)
+compustat_dtd <- compustat_dtd %>% mutate(DtD = log((E + DP_kmv) / DP_kmv) + (r - 0.5 * sig_V^2) * 30 / (sig_V * sqrt(30)))
+compustat_dtd_2 <- compustat_dtd[, c("gvkey", "permno", "DtD") ]
+compustat_dtd_2 <- compustat_dtd_2 %>%
+  distinct(gvkey, permno, .keep_all = TRUE)
+
+
+#Extracting X1-X5
+df_clean_w <- df_A_clean %>%
+  mutate(
+    X1_mean = pmin(pmax(X1_mean, quantile(X1_mean, 0.1, na.rm=T)), quantile(X1_mean, 0.99, na.rm=T)),
+    X2_mean = pmin(pmax(X2_mean, quantile(X2_mean, 0.07, na.rm=T)), quantile(X2_mean, 0.99, na.rm=T)),
+    X3_mean = pmin(pmax(X3_mean, quantile(X3_mean, 0.1, na.rm=T)), quantile(X3_mean, 0.99, na.rm=T)),
+    X4_mean = pmin(pmax(X4_mean, quantile(X4_mean, 0.01, na.rm=T)), quantile(X4_mean, 0.90, na.rm=T)),
+    X5_mean = pmin(pmax(X5_mean, quantile(X5_mean, 0.005, na.rm=T)), quantile(X5_mean, 0.95, na.rm=T))
+  ) %>%
+  
+  filter(if_all(c(X1_mean, X2_mean, X3_mean, X4_mean, X5_mean), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+filtered_wrds_exterior_dtd <- left_join(df_clean_w, compustat_dtd_2, by=c("gvkey"))
+
+saveRDS(filtered_wrds_exterior_dtd, "filtered_wrds_exterior_dtd.rds")
+```
+
+```{r}
+filtered_wrds_exterior_dtd <- readRDS("filtered_wrds_exterior_dtd.rds")
+DtD_exterior <- glm(default ~ X1_mean + X2_mean + X3_mean + X4_mean + X5_mean+DtD, 
+                    family = binomial(link = "logit"),
+                    data = filtered_wrds_exterior_dtd)
+
+summary(DtD_exterior)
+```
+
+For Altmand and Rijken 2004
+
+```{r}
+filtered_wrds <- readRDS("data/filtered_wrds.rds")
+
+#Taking the means
+df_AR <- cbind(df,df_dtd) #because last time we modified df was to compute means for                           Altman and Rijken 2004's model
+
+#Winzorize
+df_AR_clean <- df_AR %>%
+  filter(if_all(X1_mean:Age_mean, ~ is.finite(.)))
+df_AR_clean <- df_AR_clean %>%
+  mutate(default = factor(default, levels = c(0,1)))
+df_AR_clean_w <- df_AR_clean %>%
+  mutate(
+    X1_mean = pmin(pmax(X1_mean, quantile(X1_mean, 0.1, na.rm=T)), quantile(X1_mean, 0.99, na.rm=T)),
+    X2_mean = pmin(pmax(X2_mean, quantile(X2_mean, 0.07, na.rm=T)), quantile(X2_mean, 0.99, na.rm=T)),
+    X3_mean = pmin(pmax(X3_mean, quantile(X3_mean, 0.1, na.rm=T)), quantile(X3_mean, 0.99, na.rm=T)),
+    X4_mean = pmin(pmax(X4_mean, quantile(X4_mean, 0.01, na.rm=T)), quantile(X4_mean, 0.90, na.rm=T)),
+    Size_mean = pmin(pmax(Size_mean, quantile(Size_mean, 0.05, na.rm=T)), quantile(Size_mean, 0.99, na.rm=T)),
+    DtD_BS = pmin(pmax(DtD_BS, quantile(DtD_BS, 0.005, na.rm=T)), quantile(DtD_BS, 0.90, na.rm=T))
+  ) %>%
+  
+  filter(if_all(c(X1_mean, X2_mean, X3_mean, X4_mean, Size_mean), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+#Model
+altman_rijken_model_DtD_winsorized_real_mean <- glm(default ~ X1_mean + X2_mean + X3_mean + X4_mean + Size_mean + Age_mean + DtD_BS, 
+                                                    family = binomial(link = "logit"),
+                                                    data = df_AR_clean)
+summary(altman_rijken_model_DtD_winsorized_real_mean)
+```
+
+We get the same interpretation as for Altman 1968 with the DtD_BS coefficient being negative. X1, X2 and X3 are still non significant.
+
+# Long
+
+The main concern at this stage is that we took the average of the coefficients per company per year. This yields a similar problem to what we had with the average Z-score. For example, companies that have a steady value for X1 over the years might have the same average as the ones with high value at the beginning and low values at the end of the period. The same goes for the other ratios. We will deal with this in further sections where we will put our dataset in long.
+
+At the end of document 5_Enhanced_Model_Modified we provide a short continuation using a financial and macro variable. However, because the previous setting is in wide, the GDP (the macro variable) was constant and thus we needed to supress the constant of our model.
+
+This two reasons lead to us to try the model with a database in long, the next section explains briefly what we did to obtain this dataset in long but you can find it in the Drive as **filtered_wrds_long.rds**.
+
+## Reshaping the dataset into long format
+
+**From 6_Long**
+
+We transform the original wide database into a firm–year panel in long format. This step is computationally intensive, as it involves reshaping both annual and daily variables and nesting the daily series into list-columns.
+
+We first reshape all annual variables (of the form var_YYYY) into long format and reconstruct them as firm–year observations.
+
+```{r, eval=FALSE}
+df_anual <- filtered_wrds %>%
+  select(gvkey, permno, default, matches("^[^_]+_\\d{4}$")) %>%  #Only columns like wcap_1980
+  pivot_longer(
+    cols = matches("^[^_]+_\\d{4}$"),
+    names_to = c("variable", "fyear"),
+    names_pattern = "^(.+)_(\\d{4})$",
+    values_to = "valor"
+  ) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = valor
+  ) %>%
+  mutate(fyear = as.integer(fyear)) %>%
+  select(gvkey, permno, fyear, default, everything())
+```
+
+Daily variables are reshaped and then nested into list-columns by firm and year.
+
+```{r, eval = FALSE}
+df_diario <- filtered_wrds %>%
+  select(gvkey, permno, matches("^(vol|shrout|prc|cap|ret)_\\d{4}_\\d{2}_\\d{2}$")) %>%
+  pivot_longer(
+    cols = matches("^(vol|shrout|prc|cap|ret)_\\d{4}_\\d{2}_\\d{2}$"),
+    names_to = c(".value", "fecha"),
+    names_pattern = "^(vol|shrout|prc|cap|ret)_(\\d{4}_\\d{2}_\\d{2})$",
+    names_transform = list(fecha = ymd)
+  ) %>%
+  mutate(fyear = year(fecha)) %>%
+  group_by(gvkey, permno, fyear) %>%
+  summarise(
+    serie_diaria = list(
+      pick(fecha, vol, shrout, prc, cap, ret) %>% arrange(fecha)
+    ),
+    .groups = "drop"
+  )
+```
+
+We join the annual and daily datasets to obtain the final firm–year panel with nested daily series. We finally save the dataset.
+
+```{r, eval=FALSE}
+
+df_final <- df_anual %>%
+  left_join(df_diario, by = c("gvkey", "permno", "fyear")) %>%
+  arrange(gvkey, permno, fyear)
+
+saveRDS(df_final, "filtered_wrds_long.rds")
+```
+
+We reshape the dataset into long format and redo all the baseline and extended models at the firm–year level. This allows us to avoid the information loss implied by taking time averages and to exploit the full time-series and cross-sectional variation of the data.
+
+From `var1_AAAA` to `var1_AAAA_MM_DD` and pivoting to long
+
+```{r, eval=FALSE}
+annual_cols <- names(filtered_wrds)[str_detect(names(filtered_wrds), "_\\d{4}$")]
+filtered_wrds <- filtered_wrds %>%
+  rename_with(
+    .cols = all_of(annual_cols),
+    .fn = ~ str_replace(., "_(\\d{4})$", "_\\1_01_01")
+  )
+
+#Pivot long
+df_long <- filtered_wrds %>%
+  pivot_longer(
+    cols = matches("_.{4}_\\d{2}_\\d{2}$"),
+    names_to = c(".value", "fecha"),
+    names_pattern = "^(.+)_(\\d{4}_\\d{2}_\\d{2})$",
+    names_transform = list(fecha = ymd)
+  ) %>%
+  mutate(year = year(fecha)) %>%
+  select(gvkey, permno, year, default, fecha, everything()) %>%
+  arrange(gvkey, permno, fecha)
+
+colnames(df_long)[colnames(df_long) == "fecha"] <- "date"
+rm(df_long, filtered_wrds, annual_cols)
+```
+
+## Redoing the exercice with the long dataset
+
+We start by exploring the evolution of the Altman ratios X1 to X5. Because X4 is on a much larger scale, we first plot X1, X2, X3 and X5 jointly, and then X4 separately.
+
+```{r LongEvol}
+filtered_wrds_long <- readRDS("data/filtered_wrds_long.rds")
+
+#First graph: X1 to X5 without X4 (too big)
+df_x <- filtered_wrds_long %>%
+select(fyear, X1, X2, X3, X5) %>%
+pivot_longer(-fyear, names_to = "variable", values_to = "value") %>%
+group_by(fyear, variable) %>%
+summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+p1 <- ggplot(df_x, aes(x = fyear, y = mean_value, color = variable)) +
+geom_line(linewidth = 1.1) +
+geom_point(size = 1.5) +
+scale_x_continuous(breaks = seq(1980, 2010, 5)) +
+labs(title = "Evolution of X1–X5 without X4", x = "Year", y = "Mean by company", color = "Variable") +
+theme_minimal(base_size = 14)
+print(p1)
+```
+
+```{r LongEvol4}
+#X4 separately
+df_X4 <- filtered_wrds_long %>%
+group_by(fyear) %>%
+summarise(mean_X4 = mean(X4, na.rm = TRUE), .groups = "drop")
+
+pX4 <- ggplot(df_X4, aes(x = fyear, y = mean_X4)) +
+geom_line(linewidth = 1.1, color = "steelblue") +
+geom_point(size = 1.5, color = "steelblue") +
+scale_x_continuous(breaks = seq(1980, 2010, 5)) +
+labs(title = "Evolution of X4", x = "Year", y = "Mean of X4 per year") +
+theme_minimal(base_size = 14)
+print(pX4)
+
+```
+
+We obtain almost the same interpretations as for the wide dataset.
+
+We estimate the baseline model using the Altman Z-score, and then using the individual accounting ratios.
+
+```{r LongZ}
+#With Z-Score
+baseline_model <- glm(default ~ AltmanZ,
+family = binomial(link = "logit"),
+data = filtered_wrds_long)
+
+summary(baseline_model)
+```
+
+Similarly to the wide dataset the coefficient is significant but close to 0. Meaning that the only reason why it might be significant might be that the standard error is small .
+
+```{r LongA}
+#With X1–X5
+baseline_model_real <- glm(default ~ X1 + X2 + X3 + X4 + X5,
+family = binomial(link = "logit"),
+data = filtered_wrds_long)
+summary(baseline_model_real)
+```
+
+Now the coefficients that are significant are X1, X4 and X5. We have the same problem as before with X4: the value is close to 0. From this model we deduce that if the working capital increases or the total assets decrease, the probability of default decreases. This is as expected because when the company has more capital and assets it is more likely to be able to pay off it's debt in the future. Moreover, if the sales increase, then the probability of default increases. This last point is unexpected. In fact, it seems more reasonable for us to think that if sales increases, the probability of default would decrease, but we can also suppose that an increase of sales would be due to a need for companies to sell more at any price (even if it is lower than it's original price) in order to get some capital.
+
+We extend the model by adding Size and Age as in Altman and Rijken (2004).
+
+```{r, eval=FALSE}
+#Building size
+total_us_market <- tibble::tibble(
+fyear = 1980:2010,
+total_market_cap = c(
+1078442, 1111350, 1359492, 1659852, 1728298, 2154862, 2519873, 2701594, 2998741, 3528741,
+3684123, 4567891, 5123456, 5678901, 5987654, 7456789, 9123456, 11345678, 13987654, 17123456,
+16456789, 14321789, 11845678, 14567890, 16543210, 18234567, 20456789, 21567890, 13456789,
+16543210, 19234567
+)
+)
+
+filtered_wrds_long <- left_join(filtered_wrds_long,total_us_market)
+filtered_wrds_long$Size <- log(filtered_wrds_long$lt/filtered_wrds_long$total_market_cap)
+
+```
+
+```{r, eval=FALSE}
+#Building age
+crsp <- readRDS("data/crsp_cleaned_only.rds")
+crsp_first <- crsp %>%
+group_by(permno) %>%
+summarise(first_crsp_year = min(year(date))) %>%
+ungroup()
+
+filtered_wrds_long <- filtered_wrds_long %>%
+left_join(crsp_first, by = "permno")
+
+filtered_wrds_long$Age <- filtered_wrds_long$fyear-filtered_wrds_long$first_crsp_year
+filtered_wrds_long$Age <- ifelse(filtered_wrds_long$Age<0, 0, filtered_wrds_long$Age)
+
+saveRDS(filtered_wrds_long, "filtered_wrds_long.rds")
+```
+
+```{r LongDesc}
+filtered_wrds_long <- readRDS("filtered_wrds_long.rds")
+
+#Plot Size and Age
+df_as <- filtered_wrds_long %>%
+select(fyear, Age, Size) %>%
+pivot_longer(-fyear, names_to = "variable", values_to = "value") %>%
+group_by(fyear, variable) %>%
+summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+p2 <- ggplot(df_as, aes(x = fyear, y = mean_value, color = variable)) +
+geom_line(linewidth = 1.2) +
+geom_point(size = 1.8) +
+scale_x_continuous(breaks = seq(1980, 2010, 5)) +
+labs(title = "Size and Age per year", x = "Year", y = "Mean of companies", color = "Variable") +
+theme_minimal(base_size = 14)
+print(p2)
+
+```
+
+We clearly see that the mean age of companies is increasing. This is trivial as when time increases, age of companies increase if there is not a major collapse of all old companies. Size seems to be stationary and centered in -10 this means that total liabilities are negative on average.
+
+```{r LongAR}
+#Model
+Altman_Rijken_model_real <- glm(default ~ X1 + X2 + X3 + X4 + Size+ Age,
+family = binomial(link = "logit"),
+data = filtered_wrds_long)
+summary(Altman_Rijken_model_real)
+```
+
+Now everything except X1 and X2 is significant. However, the signs are inverted for some coefficients with respect to the wide dataset. X3 and age are now negative meaning that when the EBIT increases, the probability of default decreases and when the age of the company increases the probability of default decreases too. This makes more sense because if a company is selling more because of it's performance (that is captured by the EBIT) it means that it is obtaining more money and thus would be able to pay off it's debt in the future. Moreover, older companies seem to be more likely to be sustainable in terms of debt because investors know that they have survived for a long time and they are more likely to get out from any crisis or pay off any debt as they did in the past than younger companies.
+
+From the previous graphs we saw that there were some outliers, thus we decide to winsorize in the same way as in the wide dataset.
+
+```{r LongW}
+#X1-X5
+boxplot(filtered_wrds_long$X1, filtered_wrds_long$X2, filtered_wrds_long$X3, filtered_wrds_long$X5)
+boxplot( filtered_wrds_long$X4)
+
+#We clearly need to winsorize
+
+filtered_wrds_long_w <- filtered_wrds_long %>%
+  mutate(
+    X1 = pmin(pmax(X1, quantile(X1, 0.1, na.rm=T)), quantile(X1, 0.99, na.rm=T)),
+    X2 = pmin(pmax(X2, quantile(X2, 0.1, na.rm=T)), quantile(X2, 0.99, na.rm=T)),
+    X3 = pmin(pmax(X3, quantile(X3, 0.1, na.rm=T)), quantile(X3, 0.97, na.rm=T)),
+    X4 = pmin(pmax(X4, quantile(X4, 0.01, na.rm=T)), quantile(X4, 0.90, na.rm=T)),
+    X5 = pmin(pmax(X5, quantile(X5, 0.005, na.rm=T)), quantile(X5, 0.95, na.rm=T)),
+  ) %>%
+  
+  filter(if_all(c(X1, X2, X3, X4, X5), is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+boxplot(filtered_wrds_long_w$X1, 
+        filtered_wrds_long_w$X2, 
+        filtered_wrds_long_w$X3, 
+        filtered_wrds_long_w$X5)
+boxplot( filtered_wrds_long_w$X4)
+```
+
+```{r LongSBox}
+boxplot(filtered_wrds_long$Size)
+filtered_wrds_long_w_final <- filtered_wrds_long_w %>%
+  mutate(
+    Size = pmin(pmax(X1, quantile(X1, 0.05, na.rm=T)), quantile(X1, 0.99, na.rm=T))
+  ) %>%
+  
+  filter(if_all(Size, is.finite)) %>%
+  mutate(default = factor(default, levels = c(0,1)))
+
+boxplot(filtered_wrds_long_w_final$Size)
+rm(filtered_wrds_long_w)
+```
+
+We redo the models with the winsorized datasets.
+
+```{r LongAW}
+baseline_model_real_w <- glm(default ~ X1 + X2 + X3 + X4 + X5,
+family = binomial(link = "logit"),
+data = filtered_wrds_long_w_final)
+summary(baseline_model_real_w)
+```
+
+For the Altman 1968 model, we obtain the same signs for each coeficient than for the wide dataset, thus the explanations are the same.
+
+```{r LongARW}
+Altman_Rijken_model_real_w <- glm(default ~ X1 + X2 + X3 + X4 + Size+ Age,
+family = binomial(link = "logit"),
+data = filtered_wrds_long_w_final)
+summary(Altman_Rijken_model_real_w)
+```
+
+For the **Altman and Rijken 2004** now we have that everything is significant at 5% level except X3. However, the interpretations are quite similar as before. The interpretations of the coefficients are similar as we already presented.
+
+Now we will proceed to add DtD.
+
+We build the DtD variable in a similar way as for the wide dataset but this time we take the true values and not the means.
+
+```{r, eval=FALSE}
+filtered_wrds_long_w_final_DtD <- filtered_wrds_long_w_final %>%
+  mutate(
+    #Extract data from tibble (from CRSP)
+    dtd_data = map(serie_diaria, ~ {
+      .x %>%
+        summarise(
+          #Mean of market capitalization per year
+          E = mean(prc * shrout, na.rm = TRUE),
+          
+          #σ_E volatility of returns using finance formula:
+          #sigma_annual = sigma_daily * sqrt(number of trading days)
+          n_days = sum(!is.na(ret)), #Sum of days in ret
+          sigma_E_daily = sd(ret, na.rm = TRUE), #volatility when daily data
+          sigma_E = if_else(
+            n_days >= 60, 
+            #If we have more than two months we consider that we 
+            #can compute the annual volatility of E
+            sigma_E_daily * sqrt(pmin(n_days, 252)),
+            NA_real_
+          ),
+          
+          #μ_V mean return per year
+          mu_V = mean(ret, na.rm = TRUE) * 252,
+          mu_V = if_else(is.na(mu_V) | abs(mu_V) > 1, 0.06, mu_V) 
+          #If we have NAs or an absurde value (superior to the non risky asset) 
+          #we take 6% as baseline returns (based on the literature)
+        )
+    }),
+    #Computation of DP
+    DP = dlc + 0.5 * dltt,
+    #Computing naive DtD based on formula
+    DtD_naive = pmap_dbl(list(dtd_data, DP), ~ {
+      data <- ..1
+      DP <- ..2
+      if (is.na(data$E) || is.na(DP) || data$E <= 0 || DP <= 0 || is.na(data$sigma_E)) {
+        return(NA_real_)
+      } #If we lack of data, can't compute it so NA
+      #Computing values based on the course
+      sigma_D <- 0.05 + 0.25 * data$sigma_E
+      V <- data$E + DP
+      sigma_V <- (data$E / V) * data$sigma_E + (DP / V) * sigma_D
+      T <- 1
+      #Computing numerator and denominator separetly for better reading
+      num <- log((data$E + DP) / DP) + (data$mu_V - 0.5 * sigma_V^2) * T
+      den <- sigma_V * sqrt(T)
+      return(num / den) #DtD
+    }),
+    #Probability of default
+    PD = pnorm(-DtD_naive),
+  ) %>%
+  select(gvkey, fyear, default, Size, Age, DtD_naive, PD, everything(), -dtd_data, -DP)
+rm(filtered_wrds_long_w_final)
+saveRDS(filtered_wrds_long_w_final_DtD, "filtered_wrds_long_w_final_DtD.rds")
+```
+
+We do a model regressing default on DtD to check if our variable is well built.
+
+```{r LongD}
+filtered_wrds_long_w_final_DtD <- readRDS("filtered_wrds_long_w_final_DtD.rds")
+model_DtD <- glm(default ~ DtD_naive, family = binomial(link="logit"),
+                 data = filtered_wrds_long_w_final_DtD)
+summary(model_DtD)
+```
+
+When the distance to default increase, the default probability decreases: makes sense. The variable is well built.
+
+```{r LongAWD}
+baseline_model_real_w_DtD <- glm(default ~ X1 + X2 + X3 + X4 + X5 + DtD_naive,
+                                 family = binomial(link="logit"),
+                                 data = filtered_wrds_long_w_final_DtD)
+summary(baseline_model_real_w_DtD)
+```
+
+```{r LongARWD}
+Altman_Rijken_model_real_w_DtD <- glm(default ~ X1 + X2 + X3 + X4 + Size+ Age +
+                                      DtD_naive, family = binomial(link = "logit"),
+                                      data = filtered_wrds_long_w_final_DtD)
+summary(Altman_Rijken_model_real_w_DtD)
+```
+
+All the coefficients are the same as with the model without DtD. And DtD is negative.
+
+Now we try with the real DtD
+
+```{r, eval=FALSE}
+#Comparing with given DtD
+compustat_dtd <- readRDS("data/compustat_data_dtd_full.rds")
+compustat_dtd <- compustat_dtd %>% filter(gvkey %in% filtered_wrds_long_w_final_DtD$gvkey)
+compustat_dtd <- compustat_dtd %>%
+  mutate(date = ymd(date)) %>%
+  filter(year(date) >= 1980 & year(date) <= 2010)
+compustat_dtd$sig_DP <- 0.05 + 0.25 * compustat_dtd$sig_E_l_adj
+compustat_dtd <- compustat_dtd %>% mutate(sig_V = (E / (E + DP_kmv)) * sig_E_l_adj + (DP_kmv / (E + DP_kmv)) * sig_DP)
+compustat_dtd <- compustat_dtd %>% mutate(DtD = log((E + DP_kmv) / DP_kmv) + (r - 0.5 * sig_V^2) * 30 / (sig_V * sqrt(30)))
+compustat_dtd <- compustat_dtd %>% select(gvkey, permno, date, DtD)
+compustat_dtd <- compustat_dtd %>%
+  mutate(fyear = year(date)) %>%
+  select(-date)
+filtered_wrds_long_DtD <- left_join(filtered_wrds_long_w_final_DtD, compustat_dtd)
+
+saveRDS(filtered_wrds_long_DtD, "filtered_wrds_long_DtD.rds")
+```
+
+```{r LongAARDr, eval = FALSE}
+filtered_wrds_long_DtD <-readRDS("filtered_wrds_long_DtD.rds")
+
+baseline_model_real_DtD <- glm(default ~ X1 + X2 + X3 + X4 + X5 + DtD, 
+                                 family = binomial(link = "logit"),
+                                 data = filtered_wrds_long_DtD)
+summary(baseline_model_real_DtD)
+
+Altman_Rijken_model_real_DtD <- glm(default ~ X1 + X2 + X3 + X4 + Size+ Age + DtD, 
+                                      family = binomial(link = "logit"),
+                                      data = filtered_wrds_long_DtD)
+summary(Altman_Rijken_model_real_DtD)
+```
+
+**For renderization purposes we cannot display the previous chunk, the user can run it on the RMD.** When adding to the model the real DtD and not the naive we computed, we see that the coefficient for DtD is positive and there is a change in signs, meaning probably that there is some correlation in the variables.
+
+Adding macro and market variables
+
+```{r, eval=FALSE}
+#Macro variable at January the 1st of each year
+GDP <- read.csv("data/GDP.csv")
+GDP <- GDP %>%
+  filter(month(observation_date) == 01, day(observation_date) == 01) %>%
+  mutate(fyear = year(observation_date)) %>%
+  select(-observation_date)
+
+filtered_wrds_long_w_final_DtD_gdp <- left_join(filtered_wrds_long_w_final_DtD, GDP)
+```
+
+```{r, eval=FALSE}
+#Market variable - mean volume per year
+filtered_wrds_long_w_final_DtD_gdp_vol <- filtered_wrds_long_w_final_DtD_gdp %>%
+  mutate(
+    vol_mean_annual = map_dbl(serie_diaria, ~ {
+      #Extract vol and compute mean
+      mean_vol <- mean(.x$vol, na.rm = TRUE)
+      
+      #if everything is NA, then it is a NA
+      if (is.na(mean_vol)) return(NA_real_)
+      
+      return(mean_vol)
+    })
+  )
+rm(filtered_wrds_long_w_final_DtD, filtered_wrds_long_w_final_DtD_gdp, GDP)
+```
+
+```{r, eval=FALSE}
+#Saving for the future if needed
+saveRDS(filtered_wrds_long_w_final_DtD_gdp_vol, "filtered_wrds_long_w_final_DtD_gdp_vol.rds")
+```
+
+```{r LongAWDGV}
+filtered_wrds_long_w_final_DtD_gdp_vol <- readRDS("data/filtered_wrds_long_w_final_DtD_gdp_vol.rds")
+baseline_model_real_w_DtD_gdp_vol <- glm(default ~ X1 + X2 + X3 + X4 + X5 +
+                                           DtD_naive + GDP +vol_mean_annual, 
+                                 family = binomial(link = "logit"),
+                                 data = filtered_wrds_long_w_final_DtD_gdp_vol)
+summary(baseline_model_real_w_DtD_gdp_vol)
+```
+
+```{r LongARWDGV}
+Altman_Rijken_model_real_w_DtD_gdp_vol <- glm(default ~ X1 + X2 + X3 + X4 + Size+ Age + DtD_naive +GDP +vol_mean_annual, 
+                                      family = binomial(link = "logit"),
+                                      data = filtered_wrds_long_w_final_DtD_gdp_vol)
+summary(Altman_Rijken_model_real_w_DtD_gdp_vol)
+
+```
+
+When adding GDP and mean number of transactions per year, we find that all coefficients are significant at small alphas. In what respects to the coefficient of GDP, it is negative, meaning that an increase of GDP would lead to a decrease in the probability of default of a company. This makes sense as if GDP increases, there is more consumption and thus companies sell more, increasing their revenue and by consequence they are more likely to be able to pay off their debt. In what respects volume, an increase in the volume of shares that are exchange leads to a decrease in the probability of default, this is probably due to the fact that this variable can be a proxy of the measure of how much do investors wanted this company. Since a big part of investors are averse to risk, they would probably want to buy shares from a company that will not default in the short term. It is worth noting that the coefficient is quite small as well as the standard error, meaning that the fact that these coefficients are significant might be just due to the mathematics formulation and not necessary due to the data itself. **Finally, we remark that both models are similar, only that one considers X1 as non significant and X3 as significant and the other the other way around. We see here, once again, what we remarked in the graph, the two ratios are quite similar.**
+
+### Conclusion of first part
+
+Overall, the preferred specification is the baseline model augmented with the naive DtD, GDP and trading volume, which achieves the lowest AIC while remaining parsimonious.
+
+## Walk Forward in long database
+
+In script **8_1_Generating_default_year** we build a variable that is 1 if the company defaulted in year t and 0 if it did not. The script is among the documents sent, the output is the database **filtered_wrds_long_assessment.rds**. The logic is similar to the one with the wide dataset.
+
+```{r LongWalkFor}
+#Database
+filtered_wrds_long_assessment <- readRDS("data/filtered_wrds_long_assessment.rds")
+
+# ========================================
+# WALK-FORWARD VALIDATION using 1980 - (test_year -1) as training set and test_year as test set
+# ========================================
+
+#We only test with Altman model
+vars_altman <- c("X1", "X2", "X3", "X4", "X5")
+
+# ========================================
+# WALK-FORWARD LOOP
+# ========================================
+results <- list()
+roc_list <- list()
+
+for (test_year in 1981:2010) {
+  
+  cat("Processing set:", test_year, "\n")
+  
+  #Train with all years before test year
+  train_data <- filtered_wrds_long_assessment %>%
+    filter(fyear < test_year) %>%
+    select(gvkey, fyear, default_year, all_of(vars_altman)) %>%
+    na.omit()
+  
+  if (nrow(train_data) == 0) {
+    cat("No training set, SKIP.\n")
+    next
+  }
+  
+  #Test only test year
+  test_data <- filtered_wrds_long_assessment %>%
+    filter(fyear == test_year) %>%
+    select(gvkey, fyear, default_year, all_of(vars_altman)) %>%
+    na.omit()
+  
+  if (nrow(test_data) == 0) {
+    cat("No test set, SKIP.\n")
+    next
+  }
+  
+  #Altman model (train)
+  formula_altman <- as.formula(paste("default_year ~", paste(vars_altman, collapse = " + ")))
+  model <- glm(formula_altman, data = train_data, family = binomial(link = "logit"))
+  
+  #Predictions
+  pred_prob <- predict(model, newdata = test_data, type = "response")
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  #Metrics (accuracy, ROC, AUC)
+  accuracy <- mean(pred_class == test_data$default_year, na.rm = TRUE)
+  
+  roc_obj <- tryCatch(
+    roc(test_data$default_year, pred_prob, quiet = TRUE),
+    error = function(e) NULL
+  )
+  
+  auc_val <- if (!is.null(roc_obj)) as.numeric(auc(roc_obj)) else NA
+  
+  #Save them
+  results[[as.character(test_year)]] <- data.frame(
+    test_year = test_year,
+    train_years = paste(1980, test_year - 1, sep = "–"),
+    n_train = nrow(train_data),
+    n_test = nrow(test_data),
+    accuracy = accuracy,
+    auc = auc_val,
+    stringsAsFactors = FALSE
+  )
+  
+  if (!is.null(roc_obj)) {
+    roc_list[[as.character(test_year)]] <- roc_obj
+  }
+  
+  cat(sprintf("  Train: %d obs | Test: %d firms | AUC: %.3f | Acc: %.3f\n",
+              nrow(train_data), nrow(test_data), auc_val, accuracy))
+}
+
+#Final results
+#========================================
+results_df <- do.call(rbind, results)
+print(results_df)
+
+#Mean AUC
+auc_mean <- mean(results_df$auc, na.rm = TRUE)
+cat("\nMean AUC (walk-forward expanding):", round(auc_mean, 3), "\n")
+
+#ROC per year
+#========================================
+all_roc_data <- lapply(names(roc_list), function(y) {
+  r <- roc_list[[y]]
+  data.frame(
+    fpr = 1 - r$specificities,
+    tpr = r$sensitivities,
+    year = y
+  )
+}) %>% do.call(rbind, .)
+
+p1 <- ggplot(all_roc_data, aes(x = fpr, y = tpr, color = year)) +
+  geom_line(alpha = 0.7, size = 0.8) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curves per Year (Walk-Forward Expanding Window)",
+    x = "False Positive Rate (FPR)",
+    y = "True Positive Rate (TPR)",
+    color = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+print(p1)
+
+#Pooled ROC
+#========================================
+pooled_response <- unlist(lapply(roc_list, function(r) r$response))
+pooled_predictor <- unlist(lapply(roc_list, function(r) r$predictor))
+pooled_roc <- roc(pooled_response, pooled_predictor, quiet = TRUE)
+
+#AUC IC
+ci_auc <- ci.auc(pooled_roc, conf.level = 0.95)
+cat("AUC Aggregated:", round(auc(pooled_roc), 3),
+    "[", round(ci_auc[1], 3), "–", round(ci_auc[3], 3), "]\n")
+
+plot(pooled_roc, 
+     main = paste0("Agregated ROC\nAUC = ", 
+                   round(auc(pooled_roc), 3), 
+                   " [", round(ci_auc[1], 3), "–", round(ci_auc[3], 3), "]"),
+     col = "blue", lwd = 2)
+abline(0, 1, lty = 2, col = "gray")
+```
+
+We find almost the same conclusion as in the wide dataset. The only main difference is that we have oscillating ROC curves for the long dataset whereas in the wide dataset they are more in steps. The conclusions remain the same except that in the long dataset the year 2007 has even a more oscillating shape that in the wide dataset. This highlights a classic conclusion: conclude that the 2008 crisis had a great impact on the default of companies. Moreover, the crisis was quite difficult to predict from the perspective of our model.
+
+## Conclusion on the wide versus long dataset and remark
+
+In what respects to the comparison of the ROC curves between the wide and long dataset: the wide dataset setting achieves a slightly better AUC. Meaning that our approach of taking the mean over the years for each company achieves a better prediction power. However, the interpretation of the coefficients is more difficult than with the long dataset as in the wide setting they no longer represent the original Altman ratios and other variables but the mean over the years for each company of these variables. For simplification, we interpreted in a similar way in the previous analysis but it is worth to keep that in mind.
+
+# Forward analysis
+
+In what follows we will only propose results for the long dataset as it is easier to manipulate and we prefer to have a more realistic and standard with respect to the literature approach.
+
+## Ratios
+
+We added the following ratios (in script **9_Ratios**) :
+
+-   SALEAT from WRDS Industry Financial ratios = SALE/AT
+-   QUALT from WRDS Industry Financial ratios = (ACT-INVT)/LCT
+-   NIAT from WRDS Industry Financial ratios = NI/AT
+-   LCTSALE from WRDS Industry Financial ratios = LCT/SALE
+-   CHAT from WRDS Industry Financial ratios = CH/AT
+-   ACTLCT from WRDS Industry Financial ratios = ACT/LCT
+-   CHEAT from WRDS Industry Financial ratios = CHE/AT
+-   r1 from Desbois = (DLTT+DLC)/AT
+-   r6 from Desbois = (DLTT+DLC)/(REVT-COGS-xsga)
+-   r7 from Desbois = DLTT/(REVT-COGS-xsga)
+-   r11 from Desbois = WCAP/(REVT-COGS-xsga)
+-   r17 from Desbois = XiNT/(REVT-COGS-xsga)
+-   r24 from Desbois = OIBDP/AT
+-   r28 from Desbois = OIBDP/(REVT-COGS-xsga)
+-   r36 from Desbois = (PPENT+INTAN+GDWAL)/(REVT-COGS-xsga)
+-   Operating CashFlow Margin (CFM) = OANCF/REVT
+-   Capex Intensity = CAPX/AT
+-   Receivables Turnover Ratio = REVT/RECT
+-   Inventory to Sales Ratio = INVT/REVT
+-   Debt to EBITDA = (DLTT+DLC)/OIBDP
+
+```{r, eval = FALSE}
+#Databases
+compustat <- readRDS("data/compustat_all.rds")
+filtered_wrds_long_w_final_DtD_gdp_vol <- readRDS("data/filtered_wrds_long_w_final_DtD_gdp_vol.rds")
+
+#Building the ratios
+#================================
+
+df <- compustat %>%
+  mutate(
+    SALEAT = sale/at,
+    QUALT = (act-invt)/lct,
+    NIAT = ni/at,
+    LCTSALE = lct/sale,
+    CHAT = ch/at,
+    ACTLCT = act/lct,
+    CHEAT = che/at,
+    r1 = (dltt+dlc)/at,
+    r6 = (dltt+dlc)/(revt-cogs-xsga),
+    r7 = dltt/(revt-cogs-xsga),
+    r11 = wcap/(revt-cogs-xsga),
+    r17 = xint/(revt-cogs-xsga),
+    r24 = oibdp/at,
+    r28 = oibdp/(revt-cogs-xsga),
+    r36 = (ppent+intan+gdwl)/(revt-cogs-xsga),
+    Operating_CFM = oancf/revt,
+    Capex_At = capx/at,
+    RTO_r = revt/rect,
+    ITS_r = invt/revt,
+    debt_EBITDA = (dltt+dlc)/oibdp
+  ) %>%
+  select(SALEAT,QUALT, NIAT,LCTSALE,CHAT,ACTLCT,CHEAT,r1,r6,r7,r11,r17,r24,r28,r36,Operating_CFM, Capex_At, RTO_r, ITS_r,debt_EBITDA, gvkey, fyear)
+rm(compustat)
+
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios <- left_join(filtered_wrds_long_w_final_DtD_gdp_vol, df)
+
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r <- ifelse(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r == Inf, NA, filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r)
+rm(filtered_wrds_long_w_final_DtD_gdp_vol)
+rm(df)
+```
+
+We do some descriptive statistics
+
+```{r LongDescStat}
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios <- readRDS("data/filtered_wrds_long_w_final_DtD_gdp_vol_ratios.rds")
+
+#Descriptive statistics and distribution
+#================================
+
+vars <- c("SALEAT","QUALT","NIAT","LCTSALE","CHAT","ACTLCT","CHEAT",
+          "r1","r6","r7","r11","r17","r24","r28","r36",
+          "Operating_CFM","Capex_At","RTO_r","ITS_r","debt_EBITDA")
+
+for (v in vars) {
+  cat("\n=== ", v, " ===\n")
+  filtered_wrds_long_w_final_DtD_gdp_vol_ratios %>%
+    summarise(across(all_of(v), summary)) %>%
+    print()
+}
+
+#Plots
+#================================
+
+df_avg <- filtered_wrds_long_w_final_DtD_gdp_vol_ratios %>%
+  group_by(gvkey, fyear) %>%
+  summarise(across(all_of(vars), mean, na.rm = TRUE), .groups = "drop")
+df_year <- df_avg %>%
+  group_by(fyear) %>%
+  summarise(across(all_of(vars), mean, na.rm = TRUE))
+df_long <- df_year %>%
+  pivot_longer(cols = all_of(vars),
+               names_to = "variable",
+               values_to = "value")
+ggplot(df_long, aes(x = fyear, y = value)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Annual mean per company",
+       x = "Year",
+       y = "Mean value per year")
+rm(df_avg, df_year, df_long, v, vars)
+```
+
+We observe that for some ratios there is a clear trend over time. In particular, CHAT and CHEAT increase steadily, while for others this pattern is not evident in all periods. For example, ITS does not show a clear trend after 2005, which may indicate that it was affected by external shocks such as the 2008 financial crisis. Other variables, such as most of the Desbois ratios, appear to be stationary.
+
+Moreover, some ratios seem to present data issues, notably Operating_CFM and LCTSALE, which display strong yearly ups and downs as well as step-like changes. These patterns may be due to measurement problems, high sensitivity of the ratios to small changes in their components, or data inconsistencies, rather than reflecting genuine economic dynamics. This suggests that these variables should be treated with caution in the analysis. This is the reason why we decide to proceed to the last step.
+
+Finally we winsorize and save the new last dataset. We plot only one boxplot to show that there are outliers
+
+```{r LongWinBoxplot}
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT)
+```
+
+```{r LongOutliers, eval = FALSE}
+#Outliers treatment
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$SALEAT, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$QUALT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$QUALT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$QUALT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$QUALT, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$QUALT, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$NIAT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$NIAT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$NIAT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$NIAT, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$NIAT, 0.9, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$LCTSALE)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$LCTSALE <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$LCTSALE, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$LCTSALE, 0.01, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$LCTSALE, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHAT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHAT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHAT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHAT, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHAT, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ACTLCT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ACTLCT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ACTLCT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ACTLCT, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ACTLCT, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHEAT)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHEAT <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHEAT, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHEAT, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$CHEAT, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r1)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r1 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r1, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r1, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r1, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r6)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r6 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r6, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r6, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r6, 0.9, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r7)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r7 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r7, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r7, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r7, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r11)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r11 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r11, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r11, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r11, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r17)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r17 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r17, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r17, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r17, 0.9, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r24)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r24 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r24, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r24, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r24, 0.95, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r28)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r28 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r28, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r28, 0.05, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r28, 0.95, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r36)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r36 <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r36, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r36, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$r36, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Operating_CFM)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Operating_CFM <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Operating_CFM, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Operating_CFM, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Operating_CFM, 0.9, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Capex_At)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Capex_At <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Capex_At, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Capex_At, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$Capex_At, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$RTO_r, 0.80, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ITS_r)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ITS_r <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ITS_r, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ITS_r, 0, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$ITS_r, 0.90, na.rm=T))
+
+boxplot(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$debt_EBITDA)
+filtered_wrds_long_w_final_DtD_gdp_vol_ratios$debt_EBITDA <- pmin(pmax(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$debt_EBITDA, quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$debt_EBITDA, 0.1, na.rm=T)), quantile(filtered_wrds_long_w_final_DtD_gdp_vol_ratios$debt_EBITDA, 0.9, na.rm=T))
+
+#Save it
+saveRDS(filtered_wrds_long_w_final_DtD_gdp_vol_ratios, "filtered_wrds_long_w_final_DtD_gdp_vol_ratios_w.rds")
+```
+
+## Lasso
+
+We now will perform the model previously explained using the Lasso penalization and Cross validation we follow Tian et al 2015 and Chava et al. 2023
+
+```{r Lasso, eval=FALSE}
+#Database
+long_w <- readRDS("filtered_wrds_long_w_final_DtD_gdp_vol_ratios_w.rds")
+
+#Filtering NAs in default (only 30)
+long_w <- long_w %>% filter(!is.na(default))
+
+#Converting to Numeric (just in case)
+long_w$default <- as.numeric(as.character(long_w$default))
+
+#Defining the variables we will use
+X_vars <- c("X1","X2","X3","X4","X5", "SALEAT","QUALT","NIAT",
+            "LCTSALE","CHAT","ACTLCT","CHEAT",
+            "r1","r6","r7","r11","r17","r24","r28","r36",
+            "Operating_CFM","Capex_At","RTO_r","ITS_r","debt_EBITDA")
+
+
+#Global parameters
+years <- sort(unique(long_w$fyear))
+ 
+train_start <- 1980 #First year
+oos_start   <- 1991 #At least 10 years of training
+oos_end     <- 2010 #Last year
+
+K_inner <- 5 #Folds by COMPANY
+lambda_grid <- 10^seq(2, -4, length.out = 50)
+
+#Generate folds by company
+make_firm_folds <- function(gvkeys, K = 5, seed = 123) {
+  set.seed(seed) #Seed
+  firms <- unique(gvkeys) #To have the number of firms
+  folds <- split(firms, sample(rep(1:K, length.out = length(firms)))) 
+  #Generate the folds, take different samples for each fold
+  return(folds)
+}
+
+#To save the results
+results_oos <- data.frame(
+  year   = integer(),
+  auc    = numeric(),
+  lambda = numeric()
+)
+
+#Walk-Forward with Lasso restriction
+for (test_year in oos_start:oos_end) {
+  
+  cat("Processing year:", test_year, "\n")
+  
+  train <- filter(long_w, fyear < test_year)
+  test  <- filter(long_w, fyear == test_year)
+  
+  X_train_raw <- as.matrix(train[, X_vars])
+  y_train     <- train$default
+  
+  X_test_raw  <- as.matrix(test[, X_vars])
+  y_test      <- test$default
+  
+  # Scaling
+  X_train <- scale(X_train_raw)
+  X_test  <- scale(
+    X_test_raw,
+    center = attr(X_train, "scaled:center"),
+    scale  = attr(X_train, "scaled:scale")
+  )
+  
+  # Impute NAs
+  for (j in 1:ncol(X_train)) {
+    X_train[is.na(X_train[, j]), j] <- mean(X_train[, j], na.rm = TRUE)
+    X_test[is.na(X_test[, j]), j]   <- mean(X_train[, j], na.rm = TRUE)
+  }
+  
+  firm_folds <- make_firm_folds(train$gvkey, K = K_inner)
+  lambda_auc <- numeric(length(lambda_grid))
+  
+  for (l in seq_along(lambda_grid)) {
+    
+    aucs_inner <- numeric(K_inner)
+    
+    for (k in 1:K_inner) {
+      
+      val_firms <- firm_folds[[k]]
+      idx_val <- train$gvkey %in% val_firms
+      idx_tr  <- !idx_val
+      
+      fit <- glmnet(
+        x = X_train[idx_tr, ],
+        y = y_train[idx_tr],
+        family = "binomial",
+        alpha  = 1,
+        lambda = lambda_grid[l]
+      )
+      
+      prob_val <- predict(
+        fit,
+        X_train[idx_val, ],
+        type = "response"
+      )
+      
+      roc_inner <- roc(
+        y_train[idx_val],
+        as.numeric(prob_val),
+        quiet = TRUE
+      )
+      
+      aucs_inner[k] <- as.numeric(auc(roc_inner))
+    }
+    
+    lambda_auc[l] <- mean(aucs_inner, na.rm = TRUE)
+  }
+  
+  best_lambda <- lambda_grid[which.max(lambda_auc)]
+  
+  final_fit <- glmnet(
+    x = X_train,
+    y = y_train,
+    family = "binomial",
+    alpha  = 1,
+    lambda = best_lambda
+  )
+  
+  prob_oos <- predict(final_fit, X_test, type = "response")
+  
+  roc_obj <- roc(
+    y_test,
+    as.numeric(prob_oos),
+    quiet = TRUE
+  )
+  
+  results_oos <- rbind(
+    results_oos,
+    data.frame(
+      year   = test_year,
+      auc    = as.numeric(auc(roc_obj)),
+      lambda = best_lambda
+    )
+  )
+}
+
+saveRDS(results_oos, "results_oos_lasso.rds")
+```
+
+```{r, eval=FALSE}
+#Output for AUC 
+mean(results_oos$auc, na.rm = TRUE)
+
+#Lambda
+summary(results_oos$lambda)
+
+#Full model
+X_full <- scale(as.matrix(long_w[, X_vars]))
+y_full <- long_w$default
+
+#Input NAs in X_full
+for (j in 1:ncol(X_full)) {
+  X_full[is.na(X_full[, j]), j] <- mean(X_full[, j], na.rm = TRUE)
+}
+
+#Scale
+X_full <- scale(X_full)
+
+lambda_final <- median(results_oos$lambda)
+
+final_model <- glmnet(
+  X_full, y_full,
+  family = "binomial",
+  alpha  = 1,
+  lambda = lambda_final
+)
+
+#ROC Curve
+prob_final <- predict(final_model, X_full, type = "response")
+roc_obj <- roc(y_full, prob_final, quiet = TRUE)
+
+#Final AUC
+auc_value <- auc(roc_obj)
+
+saveRDS(final_model, "lasso_final_model.rds")
+saveRDS(roc_obj, "roc_lasso_final.rds")
+saveRDS(auc_value, "auc_lasso_final.rds")
+```
+
+```{r}
+results_oos <- readRDS("results_oos_lasso.rds")
+final_model <- readRDS("lasso_final_model.rds")
+roc_obj     <- readRDS("roc_lasso_final.rds")
+auc_value   <- readRDS("auc_lasso_final.rds")
+
+coef_lasso <- coef(final_model)
+coef_lasso #All coefficients chosen by Lasso
+#[1] "(Intercept)" "X2" "X4" "X5" "r17" "Operating_CFM"
+selected_vars <- rownames(coef_lasso)[
+  coef_lasso[, 1] != 0 & rownames(coef_lasso) != "(Intercept)"
+] #Their values (to make it clearer)
+
+plot(
+  roc_obj,
+  col = "blue",
+  lwd = 2,
+  main = paste0("ROC Curve (AUC = ", round(auc(roc_obj), 3), ")")
+)
+abline(a = 0, b = 1, lty = 2, col = "gray")  # diagonal 45°
+
+print(auc_value)
+```
+
+In this section, we estimate a logistic LASSO model using an expanding-window walk-forward framework. For each out-of-sample year, the model is trained on all firm-year observations available up to the previous year. Within each training period, we select the regularization parameter using an inner five-fold cross-validation procedure based on firm-level folds, ensuring that all observations of a given firm belong to the same fold and preventing cross-sectional information leakage. The optimal regularization parameter is chosen by maximizing the average out-of-sample AUC across validation folds. The final model retains four predictors: X2, X4, X5, and Operating_CFM while shrinking all remaining coefficients to zero. The resulting model achieves an average out-of-sample AUC of approximately 0.73 across the evaluation period. The interpretation of the Altman's ratios are the same as we saw before. For Operating_CFM, the coefficient is negative, meaning that companies that manage to transform their sales into available capital for investment are less likely to be in default. This makes sense as if the company can rely only on itself for investment then it does not need to pay other agents for the capital. Thus they are less likely to be in default.
+
+## XGBoost
+
+Finally, we replicate the same expanding-window walk-forward framework using gradient boosted decision trees implemented via XGBoost. Model hyperparameters: including tree depth, learning rate, and number of boosting iterations, are selected within each training period using an inner cross-validation procedure based on firm-level folds. Models are evaluated using out-of-sample AUC, ensuring comparability with the LASSO benchmark
+
+```{r, eval=FALSE}
+#Database
+long_w <- readRDS("filtered_wrds_long_w_final_DtD_gdp_vol_ratios_w.rds")
+
+#Filtering NAs in default (only 30)
+long_w <- long_w %>% filter(!is.na(default))
+
+#Converting to Numeric (just in case)
+long_w$default <- as.numeric(as.character(long_w$default))
+
+#Defining the variables we will use
+X_vars <- c("X1","X2","X3","X4","X5", "SALEAT","QUALT","NIAT",
+            "LCTSALE","CHAT","ACTLCT","CHEAT",
+            "r1","r6","r7","r11","r17","r24","r28","r36",
+            "Operating_CFM","Capex_At","RTO_r","ITS_r","debt_EBITDA")
+
+X_full <- as.matrix(long_w[, X_vars])
+y_full <- as.numeric(long_w$default)
+
+#Global parameters
+years <- sort(unique(long_w$fyear))
+
+train_start <- 1980 #First year
+oos_start   <- 1991 #At least 10 years of training
+oos_end     <- 2010 #Last year
+
+#Grid search
+param_grid <- expand.grid(
+  max_depth   = c(2, 4, 6),
+  eta         = c(0.01, 0.05, 0.1),
+  nrounds     = c(50, 100, 200)
+)
+
+K_inner <- 5 #Folds by COMPANY
+lambda_grid <- 10^seq(2, -4, length.out = 50)
+
+#Generate folds by company
+make_firm_folds <- function(gvkeys, K = 5, seed = 123) {
+  set.seed(seed) #Seed
+  firms <- unique(gvkeys) #To have the number of firms
+  folds <- split(firms, sample(rep(1:K, length.out = length(firms)))) #Generate the folds, take different samples for each fold
+  return(folds)
+}
+
+#To save the results
+results_oos <- data.frame()
+
+for (test_year in oos_start:oos_end) {
+  
+  cat("Processing year:", test_year, "\n")
+  
+  train <- filter(long_w, fyear < test_year)
+  test  <- filter(long_w, fyear == test_year)
+  
+  X_train <- as.matrix(train[, X_vars])
+  y_train <- train$default
+  
+  X_test <- as.matrix(test[, X_vars])
+  y_test <- test$default
+  
+  firm_folds <- make_firm_folds(train$gvkey, K_inner)
+  
+  best_auc <- -Inf
+  best_params <- NULL
+  
+  for (i in 1:nrow(param_grid)) {
+    
+    params_i <- param_grid[i, ]
+    aucs_inner <- numeric(K_inner)
+    
+    for (k in 1:K_inner) {
+      
+      val_firms <- firm_folds[[k]]
+      idx_val <- train$gvkey %in% val_firms
+      idx_tr  <- !idx_val
+      
+      dtrain <- xgb.DMatrix(X_train[idx_tr, ], label = y_train[idx_tr])
+      dval   <- xgb.DMatrix(X_train[idx_val, ], label = y_train[idx_val])
+      
+      bst <- xgb.train(
+        params = list(
+          max_depth = params_i$max_depth,
+          eta       = params_i$eta,
+          objective = "binary:logistic",
+          eval_metric = "auc"
+        ),
+        data    = dtrain,
+        nrounds = params_i$nrounds,
+        verbose = 0
+      )
+      
+      pred_val <- predict(bst, dval)
+      roc_obj  <- roc(y_train[idx_val], pred_val, quiet = TRUE)
+      aucs_inner[k] <- as.numeric(auc(roc_obj))
+    }
+    
+    mean_auc <- mean(aucs_inner)
+    
+    if (mean_auc > best_auc) {
+      best_auc <- mean_auc
+      best_params <- params_i
+    }
+  }
+dtrain_full <- xgb.DMatrix(X_train, label = y_train)
+  dtest       <- xgb.DMatrix(X_test, label = y_test)
+  
+  bst_final <- xgb.train(
+    params = list(
+      max_depth = best_params$max_depth,
+      eta       = best_params$eta,
+      objective = "binary:logistic",
+      eval_metric = "auc"
+    ),
+    data    = dtrain_full,
+    nrounds = best_params$nrounds,
+    verbose = 0
+  )
+  
+  pred_oos <- predict(bst_final, dtest)
+  roc_oos  <- roc(y_test, pred_oos, quiet = TRUE)
+  
+  results_oos <- rbind(
+    results_oos,
+    data.frame(
+      year      = test_year,
+      auc       = as.numeric(auc(roc_oos)),
+      max_depth = best_params$max_depth,
+      eta       = best_params$eta,
+      nrounds   = best_params$nrounds
+    )
+  )
+}
+
+saveRDS(results_oos, "results_oos_xgboost.rds")
+```
+
+```{r, eval=FALSE}
+results_oos <- readRDS("results_oos_xgboost.rds")
+
+#Choose best hyper parameters
+best_eta <- as.numeric(names(sort(table(results_oos$eta), decreasing = TRUE)[1]))
+best_nrounds <- as.numeric(names(sort(table(results_oos$nrounds), decreasing = TRUE)[1]))
+best_max_depth <- as.numeric(names(sort(table(results_oos$max_depth), decreasing = TRUE)[1]))
+
+best_eta
+best_nrounds
+best_max_depth
+
+#Make the model xgboost total
+X_full <- as.matrix(long_w[, X_vars])
+y_full <- as.numeric(long_w$default)
+
+#For NAs
+for(j in 1:ncol(X_full)){
+  X_full[is.na(X_full[,j]), j] <- mean(X_full[,j], na.rm = TRUE)
+}
+
+#Dtrain matrix
+dtrain <- xgb.DMatrix(data = X_full, label = y_full)
+
+#Model
+set.seed(123)
+bst_global <- xgb.train(
+  data = dtrain,
+  max_depth = best_max_depth,
+  eta = best_eta,
+  nrounds = best_nrounds,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+#Predict AUC
+prob_global <- predict(bst_global, dtrain)
+roc_global <- roc(y_full, prob_global, quiet = TRUE)
+auc_global <- as.numeric(auc(roc_global))
+auc_global
+
+saveRDS(bst_global,  "xgb_global_model.rds")
+saveRDS(roc_global,  "roc_xgb_global.rds")
+saveRDS(auc_global,  "auc_xgb_global.rds")
+
+#Output
+#[1] 0.05
+#[1] 50
+#[1] 2
+#[1] 0.7739245
+```
+
+```{r}
+
+results_oos <- readRDS("results_oos_xgboost.rds")
+roc_global  <- readRDS("roc_xgb_global.rds")
+auc_global  <- readRDS("auc_xgb_global.rds")
+bst_global <- readRDS("xgb_global_model.rds")
+
+#Plot evolution of AUC
+ggplot(results_oos, aes(x = year, y = auc)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_point(color = "red") +
+  ylim(0.5, 0.85) +
+  labs(
+    title = "AUC yearly OOS by year - XGBoost",
+    x = "Year",
+    y = "AUC"
+  ) +
+  theme_minimal()
+
+#ROC
+roc_df <- data.frame(
+  tpr = rev(roc_global$sensitivities),
+  fpr = rev(1 - roc_global$specificities)
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(title = paste0("ROC Curve - XGBoost Global (AUC = ", round(auc_global,3),")"),
+       x = "False Positive Rate",
+       y = "True Positive Rate") +
+  theme_minimal()
+
+bst_global
+```
+
+Finally, we select the global XGBoost hyperparameters based on their modal values across out-of-sample periods.
+
+The resulting specification uses a maximum tree depth of 2, a learning rate of 0.05, and 50 boosting iterations. These values indicate that strong predictive performance can be achieved using shallow trees and a moderate learning rate, suggesting that the relationship between financial predictors and bankruptcy risk is relatively smooth and does not require highly complex non-linear interactions.
+
+The use of shallow trees also helps mitigate potential instability arising from correlated predictors, a common feature of financial ratio data. The resulting model achieves an average out-of-sample AUC of approximately 0.77, comparable to the performance obtained with the LASSO benchmark.
+
+Finally we see that our model predicts quite well periods with no crisis but predicts less accuratly when one occurs. In particular we see in the graph that the bubble of internet crisis and the years after the 2008 crisis are not well predicted. Those were financial crisis and were periods with an increase on the number of firms that went on default.
